@@ -1,0 +1,364 @@
+diff --git a/include/ggml.h b/include/ggml.h
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -1525,12 +1525,22 @@
+             struct ggml_context * ctx, struct ggml_tensor * base, struct ggml_tensor * adapter,
+             float base_scale, float adapter_scale);
+ 
++    GGML_API struct ggml_tensor * ggml_h3_swiglu_ext(
++            struct ggml_context * ctx, struct ggml_tensor * base, struct ggml_tensor * adapter,
++            float base_scale, float adapter_scale, enum ggml_type output_type);
++
+     GGML_API struct ggml_tensor * ggml_h3_rms_modulate(
+             struct ggml_context * ctx, struct ggml_tensor * input,
+             struct ggml_tensor * weight, struct ggml_tensor * projection,
+             const int32_t * ends, const int32_t * rows, int spans,
+             int expand, int shift_index, float epsilon);
+ 
++    GGML_API struct ggml_tensor * ggml_h3_rms_modulate_ext(
++            struct ggml_context * ctx, struct ggml_tensor * input,
++            struct ggml_tensor * weight, struct ggml_tensor * projection,
++            const int32_t * ends, const int32_t * rows, int spans,
++            int expand, int shift_index, float epsilon, enum ggml_type output_type);
++
+     GGML_API struct ggml_tensor * ggml_h3_gated_residual(
+             struct ggml_context * ctx, struct ggml_tensor * input,
+             struct ggml_tensor * update, struct ggml_tensor * projection,
+diff --git a/src/ggml.c b/src/ggml.c
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -3432,10 +3432,17 @@
+ struct ggml_tensor * ggml_h3_swiglu(
+         struct ggml_context * ctx, struct ggml_tensor * base, struct ggml_tensor * adapter,
+         float base_scale, float adapter_scale) {
++    return ggml_h3_swiglu_ext(ctx, base, adapter, base_scale, adapter_scale, GGML_TYPE_F32);
++}
++
++struct ggml_tensor * ggml_h3_swiglu_ext(
++        struct ggml_context * ctx, struct ggml_tensor * base, struct ggml_tensor * adapter,
++        float base_scale, float adapter_scale, enum ggml_type output_type) {
+     GGML_ASSERT(base->type == GGML_TYPE_F32 && adapter->type == GGML_TYPE_F32);
+     GGML_ASSERT(ggml_is_contiguous(base) && ggml_is_contiguous(adapter) && ggml_are_same_shape(base, adapter));
+     GGML_ASSERT(base->ne[0] % 2 == 0);
+-    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, base->ne[0] / 2, base->ne[1], base->ne[2], base->ne[3]);
++    GGML_ASSERT(output_type == GGML_TYPE_F32 || output_type == GGML_TYPE_BF16);
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, output_type, base->ne[0] / 2, base->ne[1], base->ne[2], base->ne[3]);
+     result->op = GGML_OP_H3_SWIGLU;
+     result->src[0] = base;
+     result->src[1] = adapter;
+@@ -3448,7 +3455,7 @@
+         struct ggml_context * ctx, struct ggml_tensor * input,
+         struct ggml_tensor * auxiliary, struct ggml_tensor * projection,
+         const int32_t * ends, const int32_t * rows, int spans,
+-        int expand, int index, float epsilon, enum ggml_op op) {
++        int expand, int index, float epsilon, enum ggml_op op, enum ggml_type output_type) {
+     GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
+     GGML_ASSERT(auxiliary->type == GGML_TYPE_F32 && ggml_is_contiguous(auxiliary));
+     GGML_ASSERT(projection->type == GGML_TYPE_F32 && ggml_is_contiguous(projection));
+@@ -3466,7 +3473,8 @@
+         params[4 + span * 2] = ends[span];
+         params[5 + span * 2] = rows[span];
+     }
+-    struct ggml_tensor * result = ggml_dup_tensor(ctx, input);
++    GGML_ASSERT(output_type == GGML_TYPE_F32 || output_type == GGML_TYPE_BF16);
++    struct ggml_tensor * result = ggml_new_tensor(ctx, output_type, GGML_MAX_DIMS, input->ne);
+     result->op = op;
+     result->src[0] = input;
+     result->src[1] = auxiliary;
+@@ -3480,9 +3488,18 @@
+         struct ggml_tensor * weight, struct ggml_tensor * projection,
+         const int32_t * ends, const int32_t * rows, int spans,
+         int expand, int shift_index, float epsilon) {
++    return ggml_h3_rms_modulate_ext(ctx, input, weight, projection, ends, rows, spans,
++                                    expand, shift_index, epsilon, GGML_TYPE_F32);
++}
++
++struct ggml_tensor * ggml_h3_rms_modulate_ext(
++        struct ggml_context * ctx, struct ggml_tensor * input,
++        struct ggml_tensor * weight, struct ggml_tensor * projection,
++        const int32_t * ends, const int32_t * rows, int spans,
++        int expand, int shift_index, float epsilon, enum ggml_type output_type) {
+     GGML_ASSERT(ggml_nelements(weight) == input->ne[0] && shift_index + 1 < expand && epsilon >= 0.0f);
+     return ggml_h3_modulation_impl(ctx, input, weight, projection, ends, rows, spans,
+-                                  expand, shift_index, epsilon, GGML_OP_H3_RMS_MODULATE);
++                                  expand, shift_index, epsilon, GGML_OP_H3_RMS_MODULATE, output_type);
+ }
+ 
+ struct ggml_tensor * ggml_h3_gated_residual(
+@@ -3492,7 +3509,7 @@
+         int expand, int gate_index) {
+     GGML_ASSERT(ggml_are_same_shape(input, update));
+     return ggml_h3_modulation_impl(ctx, input, update, projection, ends, rows, spans,
+-                                  expand, gate_index, 0.0f, GGML_OP_H3_GATED_RESIDUAL);
++                                  expand, gate_index, 0.0f, GGML_OP_H3_GATED_RESIDUAL, GGML_TYPE_F32);
+ }
+ 
+ GGML_API struct ggml_tensor * ggml_mul_mat_i8_tensorwise(
+@@ -3568,7 +3585,7 @@
+         struct ggml_context * ctx,
+         struct ggml_tensor  * a,
+         int                   group_size) {
+-    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_BF16);
+     GGML_ASSERT(ggml_is_contiguous(a));
+     GGML_ASSERT(group_size > 0 && a->ne[0] % group_size == 0);
+ 
+diff --git a/src/ggml-cuda/h3-fusion.cuh b/src/ggml-cuda/h3-fusion.cuh
+--- a/src/ggml-cuda/h3-fusion.cuh
++++ b/src/ggml-cuda/h3-fusion.cuh
+@@ -73,9 +73,9 @@
+     return 0;
+ }
+ 
+-template <int BlockSize>
++template <int BlockSize, typename Output = float>
+ static __global__ void h3_rms_modulate_f32(
+-        const float * input, const float * weight, const float * projection, float * output,
++        const float * input, const float * weight, const float * projection, Output * output,
+         int channels, int tokens, h3_span_params params) {
+     const int token = blockIdx.x % tokens;
+     const int modulation_row = h3_modulation_row(token, params);
+@@ -92,7 +92,7 @@
+     for (int channel = threadIdx.x; channel < channels; channel += BlockSize) {
+         const float normalized = __fmul_rn(__fmul_rn(input[offset + channel], inverse_rms), weight[channel]);
+         const float scaled = __fmul_rn(normalized, projection[modulation_offset + channels + channel]);
+-        output[offset + channel] = __fadd_rn(__fadd_rn(normalized, scaled), projection[modulation_offset + channel]);
++        output[offset + channel] = Output(__fadd_rn(__fadd_rn(normalized, scaled), projection[modulation_offset + channel]));
+     }
+ }
+ 
+@@ -118,7 +118,19 @@
+     if (output->op == GGML_OP_H3_RMS_MODULATE) {
+         const int64_t rows = ggml_nrows(output);
+         GGML_ASSERT(rows > 0 && rows <= INT32_MAX);
+-        if (input->ne[0] < 1024) {
++        if (output->type == GGML_TYPE_BF16) {
++            if (input->ne[0] < 1024) {
++                h3_rms_modulate_f32<256, nv_bfloat16><<<rows, 256, 0, context.stream()>>>(
++                    static_cast<const float *>(input->data), static_cast<const float *>(output->src[1]->data),
++                    static_cast<const float *>(output->src[2]->data), static_cast<nv_bfloat16 *>(output->data),
++                    input->ne[0], input->ne[1], params);
++            } else {
++                h3_rms_modulate_f32<1024, nv_bfloat16><<<rows, 1024, 0, context.stream()>>>(
++                    static_cast<const float *>(input->data), static_cast<const float *>(output->src[1]->data),
++                    static_cast<const float *>(output->src[2]->data), static_cast<nv_bfloat16 *>(output->data),
++                    input->ne[0], input->ne[1], params);
++            }
++        } else if (input->ne[0] < 1024) {
+             h3_rms_modulate_f32<256><<<rows, 256, 0, context.stream()>>>(
+                 static_cast<const float *>(input->data), static_cast<const float *>(output->src[1]->data),
+                 static_cast<const float *>(output->src[2]->data), static_cast<float *>(output->data),
+@@ -163,8 +175,9 @@
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++template <typename Output = float>
+ static __global__ void h3_swiglu_f32(
+-        const float * base, const float * adapter, float * output, int channels, int64_t elements,
++        const float * base, const float * adapter, Output * output, int channels, int64_t elements,
+         float base_scale, float adapter_scale) {
+     const int64_t element = int64_t(blockIdx.x) * 256 + threadIdx.x;
+     if (element >= elements) {
+@@ -174,15 +187,22 @@
+     const float gate = __fadd_rn(__fmul_rn(base[offset], base_scale), __fmul_rn(adapter[offset], adapter_scale));
+     const float value = __fadd_rn(__fmul_rn(base[offset + channels], base_scale),
+                                 __fmul_rn(adapter[offset + channels], adapter_scale));
+-    output[element] = __fmul_rn(ggml_cuda_op_silu_single(gate), value);
++    output[element] = Output(__fmul_rn(ggml_cuda_op_silu_single(gate), value));
+ }
+ 
+ static void ggml_cuda_h3_swiglu(ggml_backend_cuda_context & context, ggml_tensor * output) {
+     const int64_t elements = ggml_nelements(output);
+-    h3_swiglu_f32<<<(elements + 255) / 256, 256, 0, context.stream()>>>(
+-        static_cast<const float *>(output->src[0]->data), static_cast<const float *>(output->src[1]->data),
+-        static_cast<float *>(output->data), output->ne[0], elements,
+-        ggml_get_op_params_f32(output, 0), ggml_get_op_params_f32(output, 1));
++    if (output->type == GGML_TYPE_BF16) {
++        h3_swiglu_f32<nv_bfloat16><<<(elements + 255) / 256, 256, 0, context.stream()>>>(
++            static_cast<const float *>(output->src[0]->data), static_cast<const float *>(output->src[1]->data),
++            static_cast<nv_bfloat16 *>(output->data), output->ne[0], elements,
++            ggml_get_op_params_f32(output, 0), ggml_get_op_params_f32(output, 1));
++    } else {
++        h3_swiglu_f32<float><<<(elements + 255) / 256, 256, 0, context.stream()>>>(
++            static_cast<const float *>(output->src[0]->data), static_cast<const float *>(output->src[1]->data),
++            static_cast<float *>(output->data), output->ne[0], elements,
++            ggml_get_op_params_f32(output, 0), ggml_get_op_params_f32(output, 1));
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -1396,12 +1396,11 @@
+     }
+ }
+ 
+-template <int group_size>
++template <int group_size, typename Input = float>
+ __global__ void quantize_rowwise_i8_convrot_cuda(
+-        const float * src, int8_t * dst, float * scales,
++        const Input * src, int8_t * dst, float * scales,
+         int64_t k, int64_t rows, int64_t dst_stride) {
+     constexpr int group_threads   = group_size / 4;
+-    constexpr int groups_per_wave = 1024 / group_threads;
+     // H4 carries a 1/2 normalization, applied log4(group_size) times.
+     constexpr float hadamard_norm = group_size == 256 ? (1.0f / 16.0f) : (1.0f / 8.0f);
+ 
+@@ -1413,39 +1412,31 @@
+ 
+     extern __shared__ float values[];
+     __shared__ float maxima[32];
+-    const float * src_row = src + row * k;
++    const Input * src_row = src + row * k;
+     int8_t * dst_row      = dst + row * dst_stride;
+ 
+     for (int64_t i = tid; i < k; i += blockDim.x) {
+-        values[i] = src_row[i] * hadamard_norm;
++        values[i] = float(src_row[i]) * hadamard_norm;
+     }
+     __syncthreads();
+ 
+-    const int group_lane = tid % group_threads;
+-    const int wave_group = tid / group_threads;
+-    const int64_t groups = k / group_size;
+-    for (int64_t group_base = 0; group_base < groups; group_base += groups_per_wave) {
+-        const int64_t group = group_base + wave_group;
+ #pragma unroll
+-        for (int stride = 1; stride < group_size; stride *= 4) {
+-            if (group < groups) {
+-                float * group_values = values + group * group_size;
+-                const int base       = (group_lane / stride) * 4 * stride + group_lane % stride;
+-                const int i0         = base;
+-                const int i1         = i0 + stride;
+-                const int i2         = i1 + stride;
+-                const int i3         = i2 + stride;
+-                const float a        = group_values[i0];
+-                const float b        = group_values[i1];
+-                const float c        = group_values[i2];
+-                const float d        = group_values[i3];
+-                group_values[i0]     =  a + b + c - d;
+-                group_values[i1]     =  a + b - c + d;
+-                group_values[i2]     =  a - b + c + d;
+-                group_values[i3]     = -a + b + c + d;
+-            }
+-            __syncthreads();
++    for (int stride = 1; stride < group_size; stride *= 4) {
++        for (int64_t butterfly = tid; butterfly < k / 4; butterfly += blockDim.x) {
++            const int64_t group = butterfly / group_threads;
++            const int group_lane = butterfly % group_threads;
++            float * group_values = values + group * group_size;
++            const int base = (group_lane / stride) * 4 * stride + group_lane % stride;
++            const float first = group_values[base];
++            const float second = group_values[base + stride];
++            const float third = group_values[base + 2 * stride];
++            const float fourth = group_values[base + 3 * stride];
++            group_values[base] = first + second + third - fourth;
++            group_values[base + stride] = first + second - third + fourth;
++            group_values[base + 2 * stride] = first - second + third + fourth;
++            group_values[base + 3 * stride] = -first + second + third + fourth;
+         }
++        __syncthreads();
+     }
+ 
+     float local_max = 0.0f;
+@@ -1647,14 +1638,15 @@
+ 
+ static void ggml_cuda_quantize_i8_convrot(
+         ggml_backend_cuda_context & ctx,
+-        const float * src,
++        const void * source,
+         int8_t * dst,
+         float * scales,
+         int64_t k,
+         int64_t rows,
+         int64_t rows_padded,
+         int64_t dst_stride,
+-        int group_size) {
++        int group_size,
++        ggml_type source_type = GGML_TYPE_F32) {
+     cudaStream_t stream = ctx.stream();
+     if (rows_padded > rows) {
+         CUDA_CHECK(cudaMemsetAsync(
+@@ -1663,6 +1655,26 @@
+ 
+     const size_t nbytes_shared = (size_t)k * sizeof(float);
+     const size_t smpbo         = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
++    if (source_type == GGML_TYPE_BF16 && nbytes_shared + 128 <= smpbo) {
++        if (group_size == 64) {
++            CUDA_CHECK(cudaFuncSetAttribute(quantize_rowwise_i8_convrot_cuda<64, nv_bfloat16>,
++                                            cudaFuncAttributeMaxDynamicSharedMemorySize, smpbo - 128));
++            quantize_rowwise_i8_convrot_cuda<64, nv_bfloat16><<<rows, 1024, nbytes_shared, stream>>>(
++                static_cast<const nv_bfloat16 *>(source), dst, scales, k, rows, dst_stride);
++        } else {
++            CUDA_CHECK(cudaFuncSetAttribute(quantize_rowwise_i8_convrot_cuda<256, nv_bfloat16>,
++                                            cudaFuncAttributeMaxDynamicSharedMemorySize, smpbo - 128));
++            quantize_rowwise_i8_convrot_cuda<256, nv_bfloat16><<<rows, 1024, nbytes_shared, stream>>>(
++                static_cast<const nv_bfloat16 *>(source), dst, scales, k, rows, dst_stride);
++        }
++        return;
++    }
++    ggml_cuda_pool_alloc<float> converted(ctx.pool());
++    const float * src = static_cast<const float *>(source);
++    if (source_type != GGML_TYPE_F32) {
++        src = converted.alloc(k * rows);
++        ggml_get_to_fp32_cuda(source_type)(source, converted.get(), k * rows, stream);
++    }
+     if (nbytes_shared + 128 <= smpbo) {
+         if (group_size == 64) {
+             CUDA_SET_SHARED_MEMORY_LIMIT(quantize_rowwise_i8_convrot_cuda<64>, smpbo - 128);
+@@ -1711,7 +1723,7 @@
+     const int64_t rows        = ggml_nrows(src);
+     const int64_t rows_padded = GGML_PAD(rows, 4);
+     const int64_t scale_rows  = (rows * (int64_t)sizeof(float) + src->ne[0] - 1) / src->ne[0];
+-    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I8 ||
++    if ((src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_BF16) || dst->type != GGML_TYPE_I8 ||
+         !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+         (group_size != 64 && group_size != 256) || src->ne[0] % group_size != 0 ||
+         dst->ne[0] != src->ne[0] || dst->ne[1] != rows_padded + scale_rows) {
+@@ -1721,14 +1733,14 @@
+     int8_t * dst_data = (int8_t *)dst->data;
+     ggml_cuda_quantize_i8_convrot(
+         ctx,
+-        (const float *)src->data,
++        src->data,
+         dst_data,
+         (float *)(dst_data + src->ne[0] * rows_padded),
+         src->ne[0],
+         rows,
+         rows_padded,
+         src->ne[0],
+-        group_size);
++        group_size, src->type);
+     return true;
+ }
+ 
+@@ -6429,7 +6441,8 @@
+         case GGML_OP_H3_RMS_MODULATE:
+         case GGML_OP_H3_GATED_RESIDUAL:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+-                   op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                   op->src[2]->type == GGML_TYPE_F32 &&
++                   (op->type == GGML_TYPE_F32 || (op->op == GGML_OP_H3_RMS_MODULATE && op->type == GGML_TYPE_BF16)) &&
+                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                    ggml_is_contiguous(op->src[2]);
+         case GGML_OP_H3_VALUE_LAYOUT:
+@@ -6437,7 +6450,8 @@
+                    op->type == GGML_TYPE_F16;
+         case GGML_OP_H3_SWIGLU:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+-                   op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
++                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16) &&
++                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+         case GGML_OP_SOL_ATTN:
+             return ggml_cuda_sol_attn_supported(dev_ctx->device, op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+@@ -6462,7 +6476,7 @@
+                 const int64_t scale_rows = src != nullptr
+                     ? (rows * (int64_t)sizeof(float) + src->ne[0] - 1) / src->ne[0]
+                     : 0;
+-                return src != nullptr && src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8 &&
++                return src != nullptr && (src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_BF16) && op->type == GGML_TYPE_I8 &&
+                        ggml_is_contiguous(src) && ggml_is_contiguous(op) &&
+                        (group_size == 64 || group_size == 256) && src->ne[0] % group_size == 0 &&
+                        op->ne[0] == src->ne[0] && op->ne[1] == rows_padded + scale_rows;

@@ -1,0 +1,32 @@
+Use existing SwiGLU on fused gate/up projections, without runtime switches.
+
+diff --git a/src/model/diffusion/qwen_image_2_1.hpp b/src/model/diffusion/qwen_image_2_1.hpp
+--- a/src/model/diffusion/qwen_image_2_1.hpp
++++ b/src/model/diffusion/qwen_image_2_1.hpp
+@@ -287,18 +287,20 @@
+             x                           = ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[1], prefix_length, true));
+             h                           = std::dynamic_pointer_cast<LayerNorm>(blocks["img_norm2"])->forward(ctx, x);
+             h                           = modulate(ctx->ggml_ctx, h, modulation[2], prefix_length);
+-            ggml_tensor* gate;
+             auto fused = blocks.find("img_mlp.gate_up");
+             if (fused != blocks.end()) {
+                 auto gate_up = std::dynamic_pointer_cast<Linear>(fused->second)->forward(ctx, h);
+-                auto parts   = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
+-                gate         = parts[0];
+-                h            = parts[1];
++                if (gate_up->type == GGML_TYPE_F32 && ggml_is_contiguous(gate_up)) {
++                    h = ggml_swiglu(ctx->ggml_ctx, gate_up);
++                } else {
++                    auto parts = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
++                    h = ggml_mul(ctx->ggml_ctx, parts[1], ggml_silu(ctx->ggml_ctx, parts[0]));
++                }
+             } else {
+-                gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
++                auto gate = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.gate_layer"])->forward(ctx, h);
+                 h    = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.proj"])->forward(ctx, h);
++                h = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
+             }
+-            h = ggml_mul(ctx->ggml_ctx, h, ggml_silu(ctx->ggml_ctx, gate));
+             h = std::dynamic_pointer_cast<Linear>(blocks["img_mlp.out"])->forward(ctx, h);
+             return ggml_add(ctx->ggml_ctx, x, modulate(ctx->ggml_ctx, h, modulation[3], prefix_length, true));
+         }

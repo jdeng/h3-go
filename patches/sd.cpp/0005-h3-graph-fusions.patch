@@ -1,0 +1,124 @@
+diff --git a/src/model/diffusion/minimax_h3.hpp b/src/model/diffusion/minimax_h3.hpp
+--- a/src/model/diffusion/minimax_h3.hpp
++++ b/src/model/diffusion/minimax_h3.hpp
+@@ -4,6 +4,7 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstring>
+ #include <set>
+ #include <string>
+ #include <tuple>
+@@ -148,7 +149,13 @@
+         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+             auto fc1 = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
+             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
+-            auto uv  = ggml_ext_chunk(ctx->ggml_ctx, fc1->forward(ctx, x), 2, 0);
++            auto gate_up = fc1->forward(ctx, x);
++#ifndef SD_USE_UPSTREAM_GGML
++            if (gate_up->type == GGML_TYPE_F32 && ggml_is_contiguous(gate_up)) {
++                return fc2->forward(ctx, ggml_swiglu(ctx->ggml_ctx, gate_up));
++            }
++#endif
++            auto uv  = ggml_ext_chunk(ctx->ggml_ctx, gate_up, 2, 0);
+             return fc2->forward(ctx, ggml_mul(ctx->ggml_ctx,
+                                               ggml_silu(ctx->ggml_ctx, uv[0]),
+                                               uv[1]));
+@@ -160,9 +167,23 @@
+         return ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2] * x->ne[3]);
+     }
+ 
+-    static ggml_tensor* apply_partial_rope(ggml_context* ctx,
++    static ggml_tensor* apply_partial_rope(GGMLRunnerContext* runner_ctx,
+                                            ggml_tensor* x,
+                                            ggml_tensor* pe) {
++        auto ctx = runner_ctx->ggml_ctx;
++#ifndef SD_USE_UPSTREAM_GGML
++        if (x->op == GGML_OP_MUL && x->src[0]->op == GGML_OP_RMS_NORM &&
++            x->ne[0] == 128 && x->src[1]->type == GGML_TYPE_F32 &&
++            ggml_nelements(x->src[1]) == 128 && ggml_is_contiguous(x->src[1]) &&
++            pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe)) {
++            float epsilon;
++            std::memcpy(&epsilon, x->src[0]->op_params, sizeof(epsilon));
++            auto fused = ggml_h3_rms_rope(ctx, x->src[0]->src[0], x->src[1], pe, epsilon);
++            if (ggml_backend_supports_op(runner_ctx->backend, fused)) {
++                return fused;
++            }
++        }
++#endif
+         int64_t rot_dim = pe->ne[2] * 2;
+         GGML_ASSERT(rot_dim <= x->ne[0]);
+         auto rotated = Rope::apply_rope(ctx,
+@@ -202,15 +223,23 @@
+ 
+             int64_t sequence = x->ne[1];
+             int64_t batch    = x->ne[2] * x->ne[3];
+-            auto qkv         = ggml_ext_chunk(ctx->ggml_ctx, qkv_proj->forward(ctx, x), 3, 0);
+-            auto q           = ggml_reshape_4d(ctx->ggml_ctx, qkv[0], head_dim, heads, sequence, batch);
+-            auto k           = ggml_reshape_4d(ctx->ggml_ctx, qkv[1], head_dim, heads, sequence, batch);
+-            auto v           = ggml_reshape_4d(ctx->ggml_ctx, qkv[2], head_dim, heads, sequence, batch);
++            auto projection  = qkv_proj->forward(ctx, x);
++            if (!ggml_is_contiguous(projection)) {
++                projection = ggml_cont(ctx->ggml_ctx, projection);
++            }
++            const size_t head_stride = head_dim * ggml_element_size(projection);
++            const size_t part_bytes = heads * head_stride;
++            auto q = ggml_view_4d(ctx->ggml_ctx, projection, head_dim, heads, sequence, batch,
++                                  head_stride, projection->nb[1], projection->nb[2], 0);
++            auto k = ggml_view_4d(ctx->ggml_ctx, projection, head_dim, heads, sequence, batch,
++                                  head_stride, projection->nb[1], projection->nb[2], part_bytes);
++            auto v = ggml_view_4d(ctx->ggml_ctx, projection, head_dim, heads, sequence, batch,
++                                  head_stride, projection->nb[1], projection->nb[2], part_bytes * 2);
+             q                = q_norm->forward(ctx, q);
+             k                = k_norm->forward(ctx, k);
+             if (pe != nullptr) {
+-                q = apply_partial_rope(ctx->ggml_ctx, q, pe);
+-                k = apply_partial_rope(ctx->ggml_ctx, k, pe);
++                q = apply_partial_rope(ctx, q, pe);
++                k = apply_partial_rope(ctx, k, pe);
+             } else {
+                 q = attention_layout(ctx->ggml_ctx, q);
+                 k = attention_layout(ctx->ggml_ctx, k);
+@@ -334,8 +363,8 @@
+                                                 projection,
+                                                 hidden_size * expand,
+                                                 timestep_rows * modalities);
+-        auto selected         = ggml_ext_slice(ctx, reshaped, 1, row, row + 1);
+-        return ggml_ext_chunk(ctx, selected, expand, 0);
++        auto selected         = ggml_ext_slice(ctx, reshaped, 1, row, row + 1, false);
++        return ggml_ext_chunk(ctx, selected, expand, 0, false);
+     }
+ 
+     static ggml_tensor* modulate_segments(ggml_context* ctx,
+@@ -355,7 +384,7 @@
+                                        expand,
+                                        modalities,
+                                        segment.modulation_row);
+-            auto part = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
++            auto part = ggml_ext_slice(ctx, x, 1, segment.start, segment.end, false);
+             part      = ggml_add(ctx,
+                                  ggml_add(ctx, part, ggml_mul(ctx, part, mods[scale_index])),
+                                  mods[shift_index]);
+@@ -374,8 +403,8 @@
+         ggml_tensor* out = nullptr;
+         for (const auto& segment : segments) {
+             auto mods = modulation_row(ctx, projection, hidden_size, 6, 3, segment.modulation_row);
+-            auto base = ggml_ext_slice(ctx, x, 1, segment.start, segment.end);
+-            auto add  = ggml_ext_slice(ctx, update, 1, segment.start, segment.end);
++            auto base = ggml_ext_slice(ctx, x, 1, segment.start, segment.end, false);
++            auto add  = ggml_ext_slice(ctx, update, 1, segment.start, segment.end, false);
+             auto part = ggml_add(ctx, base, ggml_mul(ctx, add, mods[gate_index]));
+             out       = out == nullptr ? part : ggml_concat(ctx, out, part, 1);
+         }
+diff --git a/src/model/adapter/lora.hpp b/src/model/adapter/lora.hpp
+--- a/src/model/adapter/lora.hpp
++++ b/src/model/adapter/lora.hpp
+@@ -860,7 +860,7 @@
+                                       forward_params.conv2d.scale);
+             }
+ 
+-            auto curr_out_diff = ggml_ext_scale(ctx, lx, scale_value, true);
++            auto curr_out_diff = scale_value == 1.f ? lx : ggml_ext_scale(ctx, lx, scale_value, true);
+             if (out_diff == nullptr) {
+                 out_diff = curr_out_diff;
+             } else {

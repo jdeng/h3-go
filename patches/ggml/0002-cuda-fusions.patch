@@ -1,0 +1,289 @@
+Local CUDA fusion patch: RMSNorm + RoPE and INT8 GEMM + dequant epilogue.
+Always enabled for eligible shapes; fallback paths and memory ownership are retained.
+The INT8 CUDA source is vendored in third_party/fused_int8, not a kitchen dependency.
+
+diff --git a/src/ggml-cuda/CMakeLists.txt b/src/ggml-cuda/CMakeLists.txt
+--- a/src/ggml-cuda/CMakeLists.txt
++++ b/src/ggml-cuda/CMakeLists.txt
+@@ -120,6 +120,24 @@ if (CUDAToolkit_FOUND)
+                              ${GGML_SOURCES_CUDA}
+                             )
+ 
++    set(QWEN_SERVICE_ROOT "" CACHE PATH "Qwen service source tree containing vendored INT8 kernels and CUTLASS")
++    set(QWEN_INT8_ROOT "${QWEN_SERVICE_ROOT}/third_party/fused_int8")
++    set(QWEN_CUTLASS_INCLUDE "${QWEN_SERVICE_ROOT}/deps/cutlass/include")
++    if (NOT EXISTS "${QWEN_INT8_ROOT}/cutlass_gemm_int8.cu" OR
++        NOT EXISTS "${QWEN_CUTLASS_INCLUDE}/cutlass/version.h")
++        message(FATAL_ERROR "Set QWEN_SERVICE_ROOT to the bootstrapped qwen-image-go source tree")
++    endif()
++    add_library(ggml-cuda-fused-int8 OBJECT "${QWEN_INT8_ROOT}/cutlass_gemm_int8.cu")
++    set_target_properties(ggml-cuda-fused-int8 PROPERTIES
++                          CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
++    target_include_directories(ggml-cuda-fused-int8 PRIVATE "${QWEN_CUTLASS_INCLUDE}")
++    target_compile_definitions(ggml-cuda-fused-int8 PRIVATE
++                               COMFY_HAVE_CUTLASS COMFY_CUTLASS_EXTERNAL_WORKSPACE)
++    target_compile_options(ggml-cuda-fused-int8 PRIVATE
++                           $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-O3>)
++    target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-fused-int8>)
++    set_property(SOURCE ggml-cuda.cu APPEND PROPERTY COMPILE_DEFINITIONS GGML_CUDA_COMFY_INT8)
++
+     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
+         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUBLASLT_FP8)
+         if (NOT GGML_STATIC OR WIN32)
+diff --git a/src/ggml-cuda/comfy-int8-fusion.cuh b/src/ggml-cuda/comfy-int8-fusion.cuh
+new file mode 100644
+--- /dev/null
++++ b/src/ggml-cuda/comfy-int8-fusion.cuh
+@@ -0,0 +1,46 @@
++#ifndef GGML_CUDA_COMFY_INT8_FUSION_CUH
++#define GGML_CUDA_COMFY_INT8_FUSION_CUH
++
++#ifdef GGML_CUDA_COMFY_INT8
++extern "C" bool launch_cutlass_int8_dequant(
++    const void *, const void *, const void *, const void *, const void *, void *,
++    int64_t, int64_t, int64_t, int, cudaStream_t);
++
++static thread_local ggml_cuda_pool_alloc<char> * comfy_int8_workspace = nullptr;
++
++extern "C" void * comfy_cutlass_external_workspace(size_t size, cudaStream_t stream);
++
++extern "C" void * comfy_cutlass_external_workspace(size_t size, cudaStream_t stream) {
++    GGML_UNUSED(stream);
++    if (size == 0) {
++        return nullptr;
++    }
++    GGML_ASSERT(comfy_int8_workspace != nullptr);
++    if (comfy_int8_workspace->get() == nullptr) {
++        return comfy_int8_workspace->alloc(size);
++    }
++    return comfy_int8_workspace->actual_size >= size ? comfy_int8_workspace->get() : nullptr;
++}
++
++struct ggml_cuda_comfy_int8_scope {
++    ggml_cuda_pool_alloc<char> workspace;
++    ggml_cuda_pool_alloc<char> * previous;
++
++    explicit ggml_cuda_comfy_int8_scope(ggml_cuda_pool & pool) : workspace(pool), previous(comfy_int8_workspace) {
++        comfy_int8_workspace = &workspace;
++    }
++
++    ~ggml_cuda_comfy_int8_scope() {
++        comfy_int8_workspace = previous;
++    }
++};
++
++static bool ggml_cuda_comfy_int8_eligible(int device, int64_t rows, int64_t columns, int64_t inner) {
++    const bool projection = inner == 4096 && (columns == 4096 || columns == 24576);
++    const bool down = inner == 12288 && columns == 4096;
++    return ggml_cuda_info().devices[device].cc == 1200 &&
++           rows >= 4096 && rows <= 65535 && (projection || down);
++}
++#endif
++
++#endif
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -1731,6 +1731,8 @@ static bool ggml_cuda_op_quantize_i8_convrot(
+     return true;
+ }
+ 
++#include "comfy-int8-fusion.cuh"
++
+ static void ggml_cuda_mul_mat_i8(
+         ggml_backend_cuda_context & ctx,
+         const ggml_tensor * src0,
+@@ -1776,6 +1778,15 @@ static void ggml_cuda_mul_mat_i8(
+ 
+     const float * weight_scales = dst->src[2] != nullptr ? (const float *)dst->src[2]->data : nullptr;
+     const float * bias          = dst->src[3] != nullptr ? (const float *)dst->src[3]->data : nullptr;
++#ifdef GGML_CUDA_COMFY_INT8
++    if (weight_scales != nullptr && ggml_cuda_comfy_int8_eligible(ctx.device, rows, n, k)) {
++        ggml_cuda_comfy_int8_scope workspace(ctx.pool());
++        if (launch_cutlass_int8_dequant(qdata_d, src0->data, scales_d, weight_scales, bias,
++                                       dst->data, rows, n, k, 0, stream)) {
++            return;
++        }
++    }
++#endif
+     ggml_cuda_pool_alloc<int32_t> accum(ctx.pool(), (size_t)n * rows_padded);
+ 
+     const int32_t alpha = 1;
+@@ -4185,6 +4196,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     return false;
+ }
+ 
++#include "qwen-rope-fusion.cuh"
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -4195,6 +4208,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    if (node->op == GGML_OP_RMS_NORM) {
++        const int skipped = ggml_cuda_try_fuse_qwen_rope(cuda_ctx, cgraph, i);
++        if (skipped != 0) {
++            return skipped;
++        }
++    }
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+diff --git a/src/ggml-cuda/qwen-rope-fusion.cuh b/src/ggml-cuda/qwen-rope-fusion.cuh
+new file mode 100644
+--- /dev/null
++++ b/src/ggml-cuda/qwen-rope-fusion.cuh
+@@ -0,0 +1,150 @@
++#ifndef GGML_CUDA_QWEN_ROPE_FUSION_CUH
++#define GGML_CUDA_QWEN_ROPE_FUSION_CUH
++
++static __global__ void qwen_rms_rope_f32(const float * input, const float * weight,
++                                        const float * position, float * output,
++                                        int heads, int tokens, float epsilon) {
++    const int channel = threadIdx.x;
++    const int head = blockIdx.x % heads;
++    const int token = blockIdx.x / heads;
++    const int64_t input_offset = (int64_t(token) * heads + head) * 128;
++    float sum = 0.0f;
++    if (channel < 128) {
++        const float value = input[input_offset + channel];
++        sum += value * value;
++    }
++    __shared__ float partial[8];
++    sum = block_reduce<block_reduce_method::SUM, 256>(sum, partial);
++    const float scale = rsqrtf(sum / 128.0f + epsilon);
++    if (channel < 128) {
++        const int even = channel & ~1;
++        const float first = scale * input[input_offset + even] * weight[even];
++        const float second = scale * input[input_offset + even + 1] * weight[even + 1];
++        const int64_t position_offset = (int64_t(token) * 64 + channel / 2) * 4 + (channel & 1) * 2;
++        output[(int64_t(head) * tokens + token) * 128 + channel] =
++            __fadd_rn(__fmul_rn(first, position[position_offset]),
++                      __fmul_rn(second, position[position_offset + 1]));
++    }
++}
++
++static bool qwen_rope_shape(const ggml_tensor * tensor, const std::array<int64_t, 4> & shape) {
++    return tensor != nullptr && tensor->type == GGML_TYPE_F32 &&
++           std::equal(shape.begin(), shape.end(), tensor->ne);
++}
++
++static bool qwen_rope_overlaps(const ggml_tensor * first, const ggml_tensor * second) {
++    const uintptr_t first_start = reinterpret_cast<uintptr_t>(first->data);
++    const uintptr_t second_start = reinterpret_cast<uintptr_t>(second->data);
++    return first_start < second_start + ggml_nbytes(second) &&
++           second_start < first_start + ggml_nbytes(first);
++}
++
++static int ggml_cuda_try_fuse_qwen_rope(ggml_backend_cuda_context * context, ggml_cgraph * graph, int start) {
++    if (start + 20 > graph->n_nodes) {
++        return 0;
++    }
++    ggml_tensor ** nodes = graph->nodes + start;
++    const ggml_tensor * input = nodes[0]->src[0];
++    if (input == nullptr || input->type != GGML_TYPE_F32 || input->ne[0] != 128 ||
++        input->ne[3] != 1 || !ggml_is_contiguous(input)) {
++        return 0;
++    }
++    const int64_t heads = input->ne[1], tokens = input->ne[2];
++    if (heads < 1 || heads > 128 || tokens < 1 || tokens > 65535) {
++        return 0;
++    }
++    static const ggml_op operations[] = {
++        GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_PERMUTE, GGML_OP_CONT,
++        GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_VIEW,
++        GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_PERMUTE, GGML_OP_CONT,
++        GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_RESHAPE,
++        GGML_OP_REPEAT, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_ADD,
++    };
++    static const int parents[] = {-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, -1, 10, 11, 9, 6, 14, 15, 11, 16, 13};
++    const std::array<int64_t, 4> shapes[] = {
++        {128, heads, tokens, 1}, {128, heads, tokens, 1}, {128, tokens, heads, 1},
++        {128, tokens, heads, 1}, {2, 64, tokens, heads}, {64, tokens, heads, 2},
++        {64, tokens, heads, 2}, {64, tokens, heads, 1}, {1, 64, tokens, heads},
++        {2, 64, tokens, heads}, {2, 64, tokens, 2}, {2, 64, tokens, 2},
++        {2, 64, tokens, 1}, {2, 64, tokens, heads}, {64, tokens, heads, 1},
++        {1, 64, tokens, heads}, {2, 64, tokens, heads}, {2, 64, tokens, 1},
++        {2, 64, tokens, heads}, {2, 64, tokens, heads},
++    };
++    for (int index = 0; index < 20; ++index) {
++        if (nodes[index]->op != operations[index] || !qwen_rope_shape(nodes[index], shapes[index])) {
++            return 0;
++        }
++        if (parents[index] >= 0 && nodes[index]->src[0] != nodes[parents[index]]) {
++            return 0;
++        }
++        if (index != 1 && index != 13 && index != 18 && index != 19 && nodes[index]->src[1] != nullptr) {
++            return 0;
++        }
++        if (operations[index] != GGML_OP_PERMUTE && !ggml_is_contiguous(nodes[index])) {
++            return 0;
++        }
++    }
++    const ggml_tensor * weight = nodes[1]->src[1];
++    const ggml_tensor * position = nodes[10]->src[0];
++    if (!qwen_rope_shape(weight, {128, 1, 1, 1}) || !ggml_is_contiguous(weight) ||
++        !qwen_rope_shape(position, {2, 2, 64, tokens}) || !ggml_is_contiguous(position) ||
++        nodes[13]->src[1] != nodes[12] || nodes[18]->src[1] != nodes[17] || nodes[19]->src[1] != nodes[18]) {
++        return 0;
++    }
++    const std::array<size_t, 4> strides[] = {
++        {4, size_t(512 * heads), 512, size_t(512 * heads * tokens)},
++        {8, 512, size_t(512 * tokens), 4}, {8, 16, 1024, 4},
++    };
++    const int permutations[] = {2, 5, 10};
++    for (int index = 0; index < 3; ++index) {
++        if (!std::equal(strides[index].begin(), strides[index].end(), nodes[permutations[index]]->nb)) {
++            return 0;
++        }
++    }
++    if (nodes[7]->view_offs != 0 || nodes[12]->view_offs != 0 ||
++        nodes[14]->view_offs != size_t(256 * heads * tokens) || nodes[17]->view_offs != size_t(512 * tokens)) {
++        return 0;
++    }
++    for (int index = 0; index < 20; ++index) {
++        if ((nodes[index]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            return 0;
++        }
++        if (index == 19) {
++            continue;
++        }
++        const bool output_alias = index == 13 && nodes[19]->view_src == nodes[13] &&
++                                  nodes[19]->view_offs == 0 && nodes[13]->data == nodes[19]->data;
++        if ((nodes[index]->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 && !output_alias) {
++            return 0;
++        }
++        int internal_uses = 0;
++        for (int consumer = index + 1; consumer < 20; ++consumer) {
++            for (int source = 0; source < GGML_MAX_SRC; ++source) {
++                internal_uses += nodes[consumer]->src[source] == nodes[index];
++            }
++        }
++        if (internal_uses != ggml_node_get_use_count(graph, start + index)) {
++            return 0;
++        }
++    }
++    const float epsilon = ggml_get_op_params_f32(nodes[0], 0);
++    if (!(epsilon >= 0.0f) || !std::isfinite(epsilon)) {
++        return 0;
++    }
++    ggml_tensor * output = nodes[19];
++    ggml_cuda_pool_alloc<float> temporary(context->pool());
++    float * destination = static_cast<float *>(output->data);
++    if (qwen_rope_overlaps(output, input) || qwen_rope_overlaps(output, weight) || qwen_rope_overlaps(output, position)) {
++        destination = temporary.alloc(ggml_nelements(output));
++    }
++    qwen_rms_rope_f32<<<heads * tokens, 256, 0, context->stream()>>>(
++        static_cast<const float *>(input->data), static_cast<const float *>(weight->data),
++        static_cast<const float *>(position->data), destination, int(heads), int(tokens), epsilon);
++    CUDA_CHECK(cudaGetLastError());
++    if (temporary.get() != nullptr) {
++        CUDA_CHECK(cudaMemcpyAsync(output->data, destination, ggml_nbytes(output), cudaMemcpyDeviceToDevice, context->stream()));
++    }
++    return 19;
++}
++
++#endif

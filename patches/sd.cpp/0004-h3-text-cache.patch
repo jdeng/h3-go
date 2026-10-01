@@ -1,0 +1,50 @@
+diff --git a/src/model/diffusion/minimax_h3.hpp b/src/model/diffusion/minimax_h3.hpp
+index ed7c5ac..3250e62 100644
+--- a/src/model/diffusion/minimax_h3.hpp
++++ b/src/model/diffusion/minimax_h3.hpp
+@@ -528,13 +528,20 @@ namespace MiniMaxH3 {
+                 return context;
+             }
+             GGML_ASSERT(context->ne[0] == config.text_dim);
++            const std::string cache_name = "minimax_h3.refined_context";
++            if (auto cached = ctx->load_cache_tensor(cache_name)) {
++                LOG_DEBUG("MiniMax H3: reusing refined text (%lld tokens)", static_cast<long long>(cached->ne[1]));
++                return cached;
++            }
+             auto condition_proj = std::dynamic_pointer_cast<Linear>(blocks["condition_proj"]);
+             auto token_refiner  = std::dynamic_pointer_cast<TokenRefiner>(blocks["token_refiner"]);
+             auto projected      = condition_proj->forward(ctx, context);
+             sd::ggml_graph_cut::mark_graph_cut(projected,
+                                                "minimax_h3.condition_proj",
+                                                "hidden_states");
+-            return token_refiner->forward(ctx, projected);
++            auto refined = token_refiner->forward(ctx, projected);
++            ctx->persist_cache_tensor(cache_name, refined);
++            return refined;
+         }
+ 
+         ggml_tensor* time_embedding(GGMLRunnerContext* ctx,
+@@ -961,6 +968,8 @@ namespace MiniMaxH3 {
+         sd::Tensor<int32_t> curve_index_input_cache;
+         sd::Tensor<int32_t> curve_upper_index_input_cache;
+         sd::Tensor<float> curve_fraction_input_cache;
++        std::vector<int64_t> cached_context_shape;
++        std::vector<float> cached_context_source;
+ 
+         MiniMaxH3Runner(ggml_backend_t backend,
+                         const String2TensorStorage& tensors,
+@@ -1150,6 +1159,14 @@ namespace MiniMaxH3 {
+         sd::Tensor<float> compute(int n_threads,
+                                   const DiffusionParams& params) override {
+             GGML_ASSERT(params.x != nullptr && params.timesteps != nullptr && params.context != nullptr);
++            const auto& context = *params.context;
++            if (!runner_started() || cached_context_shape != context.shape() ||
++                cached_context_source.size() != static_cast<size_t>(context.numel()) ||
++                !std::equal(cached_context_source.begin(), cached_context_source.end(), context.data())) {
++                free_cache_ctx_and_buffer();
++                cached_context_shape = context.shape();
++                cached_context_source.assign(context.data(), context.data() + context.numel());
++            }
+             const auto* extra = diffusion_extra_as<MiniMaxH3DiffusionExtra>(params);
+             static const std::vector<sd::Tensor<float>> empty_conditions;
+             static const std::vector<MiniMaxH3ReferenceBlock> empty_reference_blocks;

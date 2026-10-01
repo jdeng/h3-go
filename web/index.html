@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MiniMax H3 · Go</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; --gold: #e7b84b; --muted: #aeb4c0; }
+    * { box-sizing: border-box; }
+    body { max-width: 1180px; margin: 0 auto; padding: 28px; background: #101114; color: #f3f3f3; }
+    header { display: flex; align-items: start; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
+    h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: -.8px; } h2 { margin: 0; font-size: 18px; }
+    p { line-height: 1.55; } .muted, small { color: var(--muted); } small { display: block; margin-top: 6px; line-height: 1.5; }
+    .badge { border: 1px solid #494235; border-radius: 99px; padding: 7px 12px; color: #f2c966; white-space: nowrap; font-size: 13px; }
+    main { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 22px; align-items: start; }
+    form, .panel { display: grid; gap: 18px; padding: 22px; background: #1a1c21; border: 1px solid #343842; border-radius: 14px; }
+    label { display: grid; gap: 7px; font-size: 14px; font-weight: 500; }
+    textarea, input, select, button { width: 100%; padding: 11px; border: 1px solid #484d59; border-radius: 8px; background: #111318; color: #fff; font: inherit; }
+    textarea { min-height: 150px; resize: vertical; line-height: 1.5; } #negative { min-height: 80px; }
+    input:focus, textarea:focus, select:focus, button:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+    button { background: var(--gold); color: #17130a; border: 0; font-weight: 650; cursor: pointer; }
+    button:disabled, input:disabled, textarea:disabled { opacity: .5; cursor: not-allowed; }
+    button.secondary { background: #30343e; color: #fff; } button.danger { background: #5f2c35; color: #ffe3e7; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .switch { display: flex; align-items: center; gap: 10px; } .switch input { width: 18px; height: 18px; accent-color: var(--gold); }
+    .keyframe { padding: 12px; border: 1px dashed #565c69; border-radius: 10px; min-width: 0; }
+    .keyframe.active, .keyframe.drag { border-color: var(--gold); background: #24231f; }
+    .keyframe p { margin: 0 0 8px; font-size: 13px; } .keyframe img { width: 100%; height: 130px; object-fit: contain; border-radius: 6px; background: #111318; }
+    .keyframe button { margin-top: 8px; padding: 8px; font-size: 12px; } .keyframe input { font-size: 11px; padding: 5px; }
+    .keyframe small { font-size: 11px; overflow-wrap: anywhere; }
+    .summary { background: #111318; border-left: 3px solid var(--gold); border-radius: 5px; padding: 12px; font-size: 13px; line-height: 1.6; color: #d8dce3; white-space: pre-line; }
+    details { border-top: 1px solid #343842; padding-top: 14px; } summary { cursor: pointer; color: #d9dde5; font-size: 14px; }
+    details .grid { margin-top: 16px; } details p, details li { font-size: 13px; color: var(--muted); line-height: 1.65; }
+    details ul { padding-left: 19px; } .actions { display: flex; gap: 10px; } .actions > * { flex: 1; }
+    #status { color: var(--muted); font-size: 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .viewer { min-height: 270px; background: #090a0c; border: 1px solid #30343e; border-radius: 10px; display: grid; place-items: center; overflow: hidden; }
+    .empty { text-align: center; padding: 35px; color: #8b929f; line-height: 1.7; } .empty span { display: block; font-size: 38px; color: #4b505b; margin-bottom: 12px; }
+    video { width: 100%; max-height: 70vh; display: block; } #metadata { margin: 0; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+    a { color: #f2c966; } a.download { text-align: center; padding: 10px; border: 1px solid #484d59; border-radius: 8px; text-decoration: none; font-size: 14px; }
+    [hidden] { display: none !important; } .right { display: grid; gap: 18px; } footer { font-size: 12px; color: #858d9b; line-height: 1.6; margin-top: 22px; }
+    @media (max-width: 850px) { main { grid-template-columns: 1fr; } body { padding: 18px; } }
+    @media (max-width: 420px) { .grid { grid-template-columns: 1fr; } form, .panel { padding: 16px; } header { flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <header><div><h1>MiniMax H3 <span class="muted">· Go</span></h1><div class="muted">A prompt. A keyframe. A moving scene.</div></div><span id="health" class="badge">Connecting…</span></header>
+  <main>
+    <form id="form" autocomplete="off">
+      <label>Prompt<textarea name="prompt" required maxlength="8000" placeholder="视频描述：晨光中的红色茶壶，蒸汽缓缓升起，镜头向右平移。声音描述：轻微沸水声，没有人声。"></textarea></label>
+      <small>Describe the scene, motion, camera, dialogue and sound in one prompt. Chinese and English are supported. Your text is sent as written.</small>
+      <div><div class="grid">
+        <div class="keyframe active" id="first-slot" tabindex="0" aria-label="First frame paste target">
+          <p><strong>First frame</strong> <span class="muted">· optional</span></p>
+          <input id="first-file" type="file" accept="image/png,image/jpeg" aria-label="Upload first frame">
+          <img id="first-preview" alt="First frame preview" hidden>
+          <small id="first-info">Click this card, then paste or drop an image.</small>
+          <button id="first-remove" class="danger" type="button" hidden>Remove first frame</button>
+        </div>
+        <div class="keyframe" id="last-slot" tabindex="0" aria-label="Last frame paste target">
+          <p><strong>Last frame</strong> <span class="muted">· optional</span></p>
+          <input id="last-file" type="file" accept="image/png,image/jpeg" aria-label="Upload last frame">
+          <img id="last-preview" alt="Last frame preview" hidden>
+          <small id="last-info">Click this card, then paste or drop an image.</small>
+          <button id="last-remove" class="danger" type="button" hidden>Remove last frame</button>
+        </div>
+      </div><small>PNG/JPEG · 64 MiB total · 40 MP combined. These are start/end keyframes, not a multi-image reference gallery.</small></div>
+      <div class="grid">
+        <label>Aspect ratio<select name="aspect_ratio"><option value="source">Match keyframe (otherwise 5:3)</option><option value="5:3">5:3 · benchmark canvas</option><option value="16:9">16:9 · landscape</option><option value="9:16">9:16 · portrait</option><option value="3:2">3:2</option><option value="2:3">2:3</option><option value="1:1">1:1</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="21:9">21:9</option><option value="custom">Custom dimensions</option></select></label>
+        <label>Resolution · longest edge<select name="resolution"><option value="512">512 · quick preview</option><option value="640" selected>640 · balanced</option><option value="768">768</option><option value="960">960</option><option value="1024">1024 · slower</option></select></label>
+        <label id="width-field" hidden>Width<input name="width" type="number" min="128" max="1536" step="32" value="640" disabled></label>
+        <label id="height-field" hidden>Height<input name="height" type="number" min="128" max="1536" step="32" value="384" disabled></label>
+        <label>Requested duration · seconds<input name="duration" type="number" min="1" max="15" step="0.1" value="10" required></label>
+        <label>Seed · blank for random<input name="seed" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="random"></label>
+      </div>
+      <div class="grid"><label class="switch"><input name="turbo" type="checkbox" checked>Turbo · 8-step LoRA</label><label class="switch"><input name="audio" type="checkbox" checked>Include generated audio</label></div>
+      <div id="request-summary" class="summary"></div>
+      <details><summary>Advanced sampling</summary><div class="grid">
+        <label>Steps<input name="steps" type="number" min="1" max="50" value="8" required></label>
+        <label>Guidance · CFG<input name="cfg" type="number" min="1" max="10" step="0.1" value="1" required></label>
+        <label>Flow shift<input name="flow_shift" type="number" min="1" max="20" step="0.1" value="12" required></label>
+        <label>Turbo LoRA strength<input name="lora_strength" type="number" min="0" max="2" step="0.05" value="1" required></label>
+      </div><p>Keep CFG 1, shift 12 and Turbo strength 1 initially. Standard mode disables the LoRA and defaults to 20 steps. More steps cost more time; they do not guarantee better results.</p>
+        <label>Negative prompt · active only above CFG 1<textarea id="negative" name="negative_prompt" maxlength="8000" placeholder="Optional unwanted traits" disabled></textarea></label>
+      </details>
+      <div class="actions"><button id="submit" type="submit">Generate video</button><button id="cancel" type="button" class="secondary" hidden>Cancel</button></div>
+      <div id="status" role="status" aria-live="polite">Ready. One generation at a time; keep this tab open.</div>
+    </form>
+    <div class="right">
+      <section class="panel"><h2>Preview</h2><div class="viewer"><div id="empty" class="empty"><span>▷</span>Your next scene starts here.<br>Generated video and audio appear together.</div><video id="video" controls playsinline preload="metadata" hidden></video></div>
+        <p id="metadata" hidden></p><div id="result-actions" class="actions" hidden><a id="download" class="download" download>Download MP4</a><button id="reuse-seed" type="button" class="secondary">Reuse seed</button></div><button id="delete" type="button" class="danger" hidden>Delete this video</button>
+      </section>
+      <section class="panel"><h2>What this model can do</h2><div class="muted" style="font-size:14px;line-height:1.6">FL2VA generates video with stereo sound from text, a first frame, a last frame, or both. No ComfyUI or Python inference process is involved.</div>
+        <details><summary>Model, limits & useful defaults</summary><ul>
+          <li>Diffusion: pruned INT8 ConvRot FL2VA; text encoder: H3 Qwen3-VL-32B Q4_K_M; video VAE: FP16; audio VAE: FP32.</li>
+          <li>24 fps, 32-kHz stereo. Frame counts snap upward to 17k+5. A 10-second request produces 243 frames / 10.125 seconds, not exactly 10 seconds.</li>
+          <li>Dimensions round to 32 pixels. Custom dimensions allow exact ratios such as 576×384 for 3:2. Keyframes are resized to the output canvas; matching their ratio avoids stretching.</li>
+          <li>Turbo is faster, with potential motion/audio tradeoffs. Turn it off for base-model sampling. Sub-4-second clips are useful tests, not the official 4–15-second target range.</li>
+          <li>Disabling audio skips audio VAE decoding and MP4 audio; joint audio/video diffusion still runs.</li>
+          <li>Multiple subject references, reference audio/video, editing masks and 2K regeneration are not enabled by this local FL2VA setup.</li>
+        </ul><p><a href="https://github.com/MiniMax-AI/MiniMax-H3" target="_blank" rel="noopener noreferrer">Official H3 overview</a> · <a href="https://docs.comfy.org/tutorials/video/minimax/minimax-h3-native" target="_blank" rel="noopener noreferrer">Comfy native guide</a></p></details>
+        <small>RTX 5090 benchmark: approximately 52 seconds for 640×384, 243 frames, 8 Turbo steps. Larger canvases and 15-second clips cost more and may exhaust available VRAM. This is not an ETA guarantee.</small>
+      </section>
+    </div>
+  </main>
+  <footer>No saved prompt or upload history. Only completed MP4s are retained, without prompt metadata. This page has no result gallery or browser storage. Password protection covers generated files; use plain HTTP only on a trusted network.</footer>
+  <script>
+    const form = document.querySelector('#form');
+    const fields = form.elements;
+    const status = document.querySelector('#status');
+    const submit = document.querySelector('#submit');
+    const cancel = document.querySelector('#cancel');
+    const video = document.querySelector('#video');
+    const references = { first: null, last: null };
+    const pendingReferences = new Map();
+    let pasteTarget = 'first';
+    let controller = null;
+    let remoteBusy = false;
+    let currentResult = null;
+    const updateSubmit = () => { submit.disabled = Boolean(controller) || remoteBusy || pendingReferences.size > 0; };
+    const selectTarget = (slot) => {
+      pasteTarget = slot;
+      for (const name of ['first', 'last']) document.querySelector(`#${name}-slot`).classList.toggle('active', name === slot);
+    };
+    const updateSummary = () => {
+      const custom = fields.aspect_ratio.value === 'custom';
+      for (const name of ['width', 'height']) {
+        document.querySelector(`#${name}-field`).hidden = !custom;
+        fields[name].disabled = !custom;
+      }
+      fields.resolution.disabled = custom;
+      let ratio = 5 / 3;
+      if (fields.aspect_ratio.value === 'source') {
+        const reference = references.first || references.last;
+        if (reference) ratio = reference.width / reference.height;
+      } else if (!custom) {
+        const [numerator, denominator] = fields.aspect_ratio.value.split(':').map(Number);
+        ratio = numerator / denominator;
+      }
+      const edge = Number(fields.resolution.value);
+      const width = custom ? Number(fields.width.value) : Math.round((ratio < 1 ? edge * ratio : edge) / 32) * 32;
+      const height = custom ? Number(fields.height.value) : Math.round((ratio < 1 ? edge : edge / ratio) / 32) * 32;
+      const requested = Math.max(5, Math.ceil(Number(fields.duration.value) * 24));
+      const frames = requested + (5 - requested % 17 + 17) % 17;
+      const mode = references.first && references.last ? 'First + last frame' : references.first ? 'First frame to video' : references.last ? 'Last frame to video' : 'Text to video';
+      document.querySelector('#request-summary').textContent = `${mode} · ${width}×${height} · ${frames} frames / ${(frames / 24).toFixed(3)} s · 24 fps\n${fields.turbo.checked ? 'Turbo' : 'Standard'} · ${fields.steps.value} steps · ${fields.audio.checked ? 'Stereo audio' : 'No audio track'}`;
+      fields.negative_prompt.disabled = Number(fields.cfg.value) <= 1;
+      fields.lora_strength.disabled = !fields.turbo.checked;
+    };
+    const replaceReference = (slot, reference = null) => {
+      if (references[slot]) URL.revokeObjectURL(references[slot].url);
+      references[slot] = reference;
+      document.querySelector(`#${slot}-file`).value = '';
+      const preview = document.querySelector(`#${slot}-preview`);
+      preview.hidden = !reference;
+      if (reference) preview.src = reference.url;
+      else preview.removeAttribute('src');
+      document.querySelector(`#${slot}-remove`).hidden = !reference;
+      document.querySelector(`#${slot}-info`).textContent = reference ? `${reference.file.name || 'Pasted image'} · ${reference.width}×${reference.height}` : 'Click this card, then paste or drop an image.';
+      updateSummary();
+    };
+    const loadFiles = async (slot, files) => {
+      const token = Symbol();
+      pendingReferences.set(slot, token);
+      document.querySelector(`#${slot}-remove`).hidden = false;
+      updateSubmit();
+      let url;
+      try {
+        if (files.length !== 1) throw new Error('Select one image for each keyframe.');
+        const file = files[0];
+        if (!['image/png', 'image/jpeg'].includes(file.type)) throw new Error('Use a PNG or JPEG image.');
+        if (file.size > 63 * 1024 * 1024) throw new Error('Keep images below 63 MiB combined (64 MiB request limit).');
+        url = URL.createObjectURL(file);
+        const picture = new Image();
+        await new Promise((resolve, reject) => { picture.onload = resolve; picture.onerror = () => reject(new Error('This image could not be decoded.')); picture.src = url; });
+        if (pendingReferences.get(slot) !== token) return;
+        const other = references[slot === 'first' ? 'last' : 'first'];
+        if (file.size + (other?.file.size || 0) > 63 * 1024 * 1024) throw new Error('Keep images below 63 MiB combined (64 MiB request limit).');
+        if (picture.naturalWidth * picture.naturalHeight + (other ? other.width * other.height : 0) > 40 * 1024 * 1024) throw new Error('Images exceed the combined 40 MP limit.');
+        replaceReference(slot, { file, url, width: picture.naturalWidth, height: picture.naturalHeight });
+        url = null;
+        selectTarget(slot);
+        status.textContent = `${slot === 'first' ? 'First' : 'Last'} frame updated.`;
+      } catch (error) {
+        if (pendingReferences.get(slot) === token) status.textContent = error.message;
+      } finally {
+        if (url) URL.revokeObjectURL(url);
+        if (pendingReferences.get(slot) === token) {
+          pendingReferences.delete(slot);
+          document.querySelector(`#${slot}-remove`).hidden = !references[slot];
+        }
+        updateSubmit();
+      }
+    };
+    for (const slot of ['first', 'last']) {
+      const card = document.querySelector(`#${slot}-slot`);
+      document.querySelector(`#${slot}-file`).addEventListener('change', (event) => { if (event.target.files.length) loadFiles(slot, Array.from(event.target.files)); });
+      document.querySelector(`#${slot}-remove`).addEventListener('click', () => { pendingReferences.delete(slot); replaceReference(slot); updateSubmit(); status.textContent = 'Keyframe removed.'; });
+      card.addEventListener('click', () => selectTarget(slot));
+      card.addEventListener('focusin', () => selectTarget(slot));
+      card.addEventListener('dragover', (event) => { event.preventDefault(); card.classList.add('drag'); });
+      card.addEventListener('dragleave', () => card.classList.remove('drag'));
+      card.addEventListener('drop', (event) => { event.preventDefault(); card.classList.remove('drag'); loadFiles(slot, Array.from(event.dataTransfer.files)); });
+    }
+    document.addEventListener('paste', (event) => {
+      const files = Array.from(event.clipboardData?.items || []).filter((item) => item.kind === 'file').map((item) => item.getAsFile()).filter(Boolean);
+      if (!files.length) return;
+      event.preventDefault();
+      loadFiles(pasteTarget, files);
+    });
+    fields.turbo.addEventListener('change', () => { fields.steps.value = fields.turbo.checked ? 8 : 20; updateSummary(); });
+    form.addEventListener('input', updateSummary);
+    form.addEventListener('change', updateSummary);
+    const checkHealth = async () => {
+      try {
+        const response = await fetch('/healthz');
+        if (!response.ok) throw new Error('offline');
+        const health = await response.json();
+        remoteBusy = health.busy;
+        document.querySelector('#health').textContent = remoteBusy ? 'GPU busy' : 'Backend ready';
+      } catch { document.querySelector('#health').textContent = 'Backend offline'; }
+      updateSubmit();
+    };
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (controller || remoteBusy || pendingReferences.size) return;
+      updateSummary();
+      controller = new AbortController();
+      submit.disabled = true;
+      cancel.hidden = false;
+      const started = Date.now();
+      status.textContent = 'Generating: loading models, sampling, then encoding…';
+      const timer = setInterval(() => { status.textContent = `Generating… ${((Date.now() - started) / 1000).toFixed(0)} s elapsed. Keep this tab open.`; }, 1000);
+      try {
+        const data = new FormData(form);
+        data.set('turbo', String(fields.turbo.checked));
+        data.set('audio', String(fields.audio.checked));
+        if (fields.aspect_ratio.value === 'custom') data.delete('aspect_ratio');
+        for (const slot of ['first', 'last']) if (references[slot]) data.append(`${slot}_frame`, references[slot].file, references[slot].file.name || `${slot}.png`);
+        const response = await fetch('/api/generate', { method: 'POST', body: data, signal: controller.signal });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || 'Generation failed.');
+        currentResult = payload;
+        video.src = payload.video_url;
+        video.hidden = false;
+        document.querySelector('#empty').hidden = true;
+        const download = document.querySelector('#download');
+        download.href = payload.video_url; download.download = payload.filename;
+        document.querySelector('#metadata').textContent = `${payload.mode} · ${payload.width}×${payload.height} · ${payload.frames} frames / ${payload.duration.toFixed(3)} s · seed ${payload.seed_text} · ${payload.elapsed_seconds.toFixed(1)} s to generate`;
+        for (const identifier of ['metadata', 'result-actions', 'delete']) document.querySelector(`#${identifier}`).hidden = false;
+        status.textContent = `Done in ${payload.elapsed_seconds.toFixed(1)} seconds. Video saved; prompt and uploads are not retained.`;
+      } catch (error) {
+        status.textContent = error.name === 'AbortError' ? 'Cancellation requested. The GPU is released at the next safe boundary.' : error.message;
+      } finally {
+        clearInterval(timer);
+        controller = null;
+        cancel.hidden = true;
+        await checkHealth();
+      }
+    });
+    cancel.addEventListener('click', () => controller?.abort());
+    document.querySelector('#reuse-seed').addEventListener('click', () => { if (currentResult) fields.seed.value = currentResult.seed_text; });
+    document.querySelector('#delete').addEventListener('click', async () => {
+      if (!currentResult || !confirm('Permanently delete this generated video?')) return;
+      const deleting = currentResult;
+      try {
+        const response = await fetch(`/api/outputs/${deleting.filename}`, { method: 'DELETE' });
+        if (!response.ok) throw new Error('Could not delete the video.');
+        if (currentResult !== deleting) return;
+        video.pause(); video.removeAttribute('src'); video.load(); video.hidden = true;
+        document.querySelector('#empty').hidden = false;
+        for (const identifier of ['metadata', 'result-actions', 'delete']) document.querySelector(`#${identifier}`).hidden = true;
+        currentResult = null;
+        status.textContent = 'Video deleted.';
+      } catch (error) { status.textContent = error.message; }
+    });
+    updateSummary();
+    checkHealth();
+    setInterval(checkHealth, 5000);
+  </script>
+</body>
+</html>

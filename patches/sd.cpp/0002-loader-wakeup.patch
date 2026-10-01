@@ -1,0 +1,75 @@
+Replace polling sleeps with worker completion notification.
+
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -2,6 +2,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cinttypes>
++#include <condition_variable>
+ #include <cstdarg>
+ #include <cstdlib>
+ #include <fstream>
+@@ -1125,9 +1126,24 @@
+         std::atomic<bool> failed(false);
+         std::vector<std::thread> workers;
+         std::mutex backend_tensor_set_mutex;
++        std::mutex completion_mutex;
++        std::condition_variable completion_ready;
++        int workers_remaining = n_threads;
++        struct WorkerCompletion {
++            std::mutex& mutex;
++            std::condition_variable& ready;
++            int& remaining;
++
++            ~WorkerCompletion() {
++                std::lock_guard<std::mutex> lock(mutex);
++                --remaining;
++                ready.notify_one();
++            }
++        };
+ 
+         for (int i = 0; i < n_threads; ++i) {
+             workers.emplace_back([&, file_path, is_zip]() {
++                WorkerCompletion completion{completion_mutex, completion_ready, workers_remaining};
+                 std::ifstream file;
+                 zip_t* zip = nullptr;
+                 if (is_zip) {
+@@ -1337,20 +1353,23 @@
+             });
+         }
+ 
+-        while (true) {
+-            size_t current_idx = tensor_idx.load();
+-            if (current_idx >= tensors_to_process.size() || failed) {
+-                break;
+-            }
+-            size_t curr_num       = total_tensors_processed + current_idx;
+-            float elapsed_seconds = (ggml_time_ms() - t_start) / 1000.0f;
+-            if (log_progress && total_tensors_to_process > 0) {
+-                pretty_bytes_progress(static_cast<int>(curr_num),
+-                                      static_cast<int>(total_tensors_to_process),
+-                                      bytes_processed.load(),
+-                                      elapsed_seconds);
++        {
++            std::unique_lock<std::mutex> completion_lock(completion_mutex);
++            while (workers_remaining > 0) {
++                size_t current_idx    = std::min(tensor_idx.load(), tensors_to_process.size());
++                size_t curr_num       = total_tensors_processed + current_idx;
++                float elapsed_seconds = (ggml_time_ms() - t_start) / 1000.0f;
++                if (log_progress && total_tensors_to_process > 0) {
++                    pretty_bytes_progress(static_cast<int>(curr_num),
++                                          static_cast<int>(total_tensors_to_process),
++                                          bytes_processed.load(),
++                                          elapsed_seconds);
++                }
++                completion_ready.wait_for(
++                    completion_lock,
++                    std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200),
++                    [&]() { return workers_remaining == 0; });
+             }
+-            std::this_thread::sleep_for(std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
+         }
+ 
+         for (auto& w : workers) {

@@ -1,0 +1,44 @@
+--- a/src/ggml-cuda/CMakeLists.txt
++++ b/src/ggml-cuda/CMakeLists.txt
+@@ -120,17 +120,17 @@
+                              ${GGML_SOURCES_CUDA}
+                             )
+ 
+-    set(QWEN_SERVICE_ROOT "" CACHE PATH "Qwen service source tree containing vendored INT8 kernels and CUTLASS")
+-    set(QWEN_INT8_ROOT "${QWEN_SERVICE_ROOT}/third_party/fused_int8")
+-    set(QWEN_CUTLASS_INCLUDE "${QWEN_SERVICE_ROOT}/deps/cutlass/include")
+-    if (NOT EXISTS "${QWEN_INT8_ROOT}/cutlass_gemm_int8.cu" OR
+-        NOT EXISTS "${QWEN_CUTLASS_INCLUDE}/cutlass/version.h")
+-        message(FATAL_ERROR "Set QWEN_SERVICE_ROOT to the bootstrapped qwen-image-go source tree")
+-    endif()
+-    add_library(ggml-cuda-fused-int8 OBJECT "${QWEN_INT8_ROOT}/cutlass_gemm_int8.cu")
++    set(H3_SERVICE_ROOT "" CACHE PATH "H3 source tree containing vendored INT8 kernels and CUTLASS")
++    set(H3_INT8_ROOT "${H3_SERVICE_ROOT}/third_party/fused_int8")
++    set(H3_CUTLASS_INCLUDE "${H3_SERVICE_ROOT}/deps/cutlass/include")
++    if (NOT EXISTS "${H3_INT8_ROOT}/cutlass_gemm_int8.cu" OR
++        NOT EXISTS "${H3_CUTLASS_INCLUDE}/cutlass/version.h")
++        message(FATAL_ERROR "Set H3_SERVICE_ROOT to the bootstrapped h3-go source tree")
++    endif()
++    add_library(ggml-cuda-fused-int8 OBJECT "${H3_INT8_ROOT}/cutlass_gemm_int8.cu")
+     set_target_properties(ggml-cuda-fused-int8 PROPERTIES
+                           CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+-    target_include_directories(ggml-cuda-fused-int8 PRIVATE "${QWEN_CUTLASS_INCLUDE}")
++    target_include_directories(ggml-cuda-fused-int8 PRIVATE "${H3_CUTLASS_INCLUDE}")
+     target_compile_definitions(ggml-cuda-fused-int8 PRIVATE
+                                COMFY_HAVE_CUTLASS COMFY_CUTLASS_EXTERNAL_WORKSPACE)
+     target_compile_options(ggml-cuda-fused-int8 PRIVATE
+--- a/src/ggml-cuda/comfy-int8-fusion.cuh
++++ b/src/ggml-cuda/comfy-int8-fusion.cuh
+@@ -38,8 +38,11 @@
+ static bool ggml_cuda_comfy_int8_eligible(int device, int64_t rows, int64_t columns, int64_t inner) {
+     const bool projection = inner == 4096 && (columns == 4096 || columns == 24576);
+     const bool down = inner == 12288 && columns == 4096;
++    const bool h3_projection = inner == 5376 && (columns == 21504 || columns == 28672);
++    const bool h3_output = (inner == 7168 || inner == 14336) && columns == 5376;
+     return ggml_cuda_info().devices[device].cc == 1200 &&
+-           rows >= 4096 && rows <= 65535 && (projection || down);
++           rows <= 65535 && ((rows >= 4096 && (projection || down)) ||
++                             (rows >= 128 && (h3_projection || h3_output)));
+ }
+ #endif
+ 

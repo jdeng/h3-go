@@ -1,0 +1,474 @@
+Adapted from https://github.com/leejet/stable-diffusion.cpp/pull/2010
+Upstream PR head: 631907c311053846797d0dae7289734d437fb00f
+Base: 3f8527a46c54ecf4cb4ed6003da8e8982283c73c
+Includes local loader, packed-input and shared-quantization compatibility fixes.
+
+diff --git a/src/core/ggml_extend.cpp b/src/core/ggml_extend.cpp
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -290,6 +290,41 @@
+ #endif
+ }
+ 
++ggml_tensor* ggml_ext_linear_w4_convrot(ggml_context* ctx,
++                                        ggml_tensor* x,
++                                        ggml_tensor* w,
++                                        ggml_tensor* weight_scales,
++                                        ggml_tensor* s_channel,
++                                        ggml_tensor* s_rel,
++                                        ggml_tensor* b,
++                                        int w4_convrot_kind,
++                                        int convrot_group_size,
++                                        float scale) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 || (x->type == GGML_TYPE_I8 && scale == 1.f));
++    if (scale != 1.f) {
++        x = ggml_ext_scale(ctx, x, scale);
++    }
++
++    ggml_tensor* fused_bias = scale == 1.f ? b : nullptr;
++    if (x->ne[2] * x->ne[3] > 1024) {
++        int64_t ne2 = x->ne[2];
++        int64_t ne3 = x->ne[3];
++        x           = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1] * x->ne[2] * x->ne[3]);
++        x           = ggml_mul_mat_w4_convrot(ctx, w, x, weight_scales, s_channel, s_rel, fused_bias, w4_convrot_kind, convrot_group_size);
++        x           = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1] / ne2 / ne3, ne2, ne3);
++    } else {
++        x = ggml_mul_mat_w4_convrot(ctx, w, x, weight_scales, s_channel, s_rel, fused_bias, w4_convrot_kind, convrot_group_size);
++    }
++
++    if (scale != 1.f) {
++        x = ggml_ext_scale(ctx, x, 1.f / scale);
++        if (b != nullptr) {
++            x = ggml_add_inplace(ctx, x, b);
++        }
++    }
++    return x;
++}
++
+ ggml_tensor* ggml_ext_pad_ext(ggml_context* ctx,
+                               ggml_backend_t backend,
+                               ggml_tensor* x,
+diff --git a/src/core/ggml_extend.h b/src/core/ggml_extend.h
+--- a/src/core/ggml_extend.h
++++ b/src/core/ggml_extend.h
+@@ -80,6 +80,20 @@
+                                            int convrot_group_size,
+                                            float scale = 1.f);
+ 
++// packed-w4 convrot linear; weight_scales is [N] F32 row scales for W4A4, or
++// the [16] F32 codebook for W4A8 (with s_channel [N] and s_rel F8_E4M3
++// [K/16, N] supplied; both null for W4A4)
++ggml_tensor* ggml_ext_linear_w4_convrot(ggml_context* ctx,
++                                        ggml_tensor* x,
++                                        ggml_tensor* w,
++                                        ggml_tensor* weight_scales,
++                                        ggml_tensor* s_channel,
++                                        ggml_tensor* s_rel,
++                                        ggml_tensor* b,
++                                        int w4_convrot_kind,
++                                        int convrot_group_size,
++                                        float scale = 1.f);
++
+ ggml_tensor* ggml_ext_pad_ext(ggml_context* ctx,
+                               ggml_backend_t backend,
+                               ggml_tensor* x,
+diff --git a/src/core/ggml_runner.h b/src/core/ggml_runner.h
+--- a/src/core/ggml_runner.h
++++ b/src/core/ggml_runner.h
+@@ -84,6 +84,7 @@
+     std::function<void(const std::string&, ggml_tensor*)> cache_tensor;
+     std::function<void(ggml_tensor*, const void*)> set_backend_tensor_data;
+     std::map<std::pair<ggml_tensor*, int>, ggml_tensor*> int8_convrot_cache;
++    std::map<std::pair<ggml_tensor*, int>, ggml_tensor*> convrot_f32_cache;
+ 
+     void capture_tensor(const std::string& name, ggml_tensor* tensor) {
+         if (debug_tensors == nullptr || tensor == nullptr) {
+diff --git a/src/model/common/ggml_block.hpp b/src/model/common/ggml_block.hpp
+--- a/src/model/common/ggml_block.hpp
++++ b/src/model/common/ggml_block.hpp
+@@ -139,6 +139,41 @@
+     }
+ };
+ 
++// Normalized regular Hadamard transform (H/gs^0.5) applied independently to each
++// contiguous group of group_size elements along ne0, expressed as a butterfly of
++// view/add/sub/concat stages so it runs on every backend without a dedicated op.
++__STATIC_INLINE__ ggml_tensor* ggml_regular_hadamard_f32(ggml_context* ctx, ggml_tensor* x, int group_size) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(group_size > 1 && (group_size & (group_size - 1)) == 0);
++    GGML_ASSERT(x->ne[0] % group_size == 0);
++    const int64_t gs     = group_size;
++    const int64_t n_rows = ggml_nelements(x) / x->ne[0];
++    const int64_t m      = x->ne[0] / gs;  // independent Hadamard groups per row
++    ggml_tensor* y       = ggml_reshape_3d(ctx, x, gs, m, n_rows);
++    for (int64_t b = gs; b > 1; b /= 2) {
++        const int64_t h                = b / 2;
++        const int64_t blocks_per_group = (gs / b) * m;
++        if (ggml_nelements(y) != h * 2 * blocks_per_group * n_rows || !ggml_is_contiguous(y)) {
++            fprintf(stderr, "hadamard stage pre-check failed: b=%lld h=%lld y=[%lld,%lld,%lld,%lld] n_rows=%lld\n",
++                    (long long)b, (long long)h, (long long)y->ne[0], (long long)y->ne[1], (long long)y->ne[2],
++                    (long long)y->ne[3], (long long)n_rows);
++            GGML_ABORT("ggml_regular_hadamard_f32 stage shape mismatch");
++        }
++        ggml_tensor* v      = ggml_reshape_4d(ctx, y, h, 2, blocks_per_group, n_rows);
++        const size_t nb1    = ggml_row_size(GGML_TYPE_F32, h);
++        const size_t nb2    = ggml_row_size(GGML_TYPE_F32, 2 * h);
++        const size_t nb3    = ggml_row_size(GGML_TYPE_F32, 2 * h * blocks_per_group);
++        ggml_tensor* top    = ggml_view_4d(ctx, v, h, 1, blocks_per_group, n_rows, nb1, nb2, nb3, 0);
++        ggml_tensor* bottom = ggml_view_4d(ctx, v, h, 1, blocks_per_group, n_rows, nb1, nb2, nb3, h * sizeof(float));
++        ggml_tensor* sum    = ggml_add(ctx, top, bottom);
++        ggml_tensor* diff   = ggml_sub(ctx, top, bottom);
++        y                   = ggml_concat(ctx, sum, diff, 0);
++    }
++    y = ggml_scale(ctx, y, 1.0f / sqrtf((float)gs));
++    return ggml_reshape_4d(ctx, y, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
++}
++
+ class Linear : public UnaryBlock {
+ protected:
+     int64_t in_features;
+@@ -149,6 +184,8 @@
+     bool has_weight_scale       = false;
+     bool int8_convrot           = false;
+     int int8_convrot_group_size = 0;
++    int w4_convrot_kind         = W4_CONVROT_NONE;
++    int w4_convrot_group_size   = 0;
+     float scale;
+     std::string prefix;
+ 
+@@ -157,19 +194,28 @@
+         has_weight_scale        = false;
+         int8_convrot            = false;
+         int8_convrot_group_size = 0;
++        w4_convrot_kind               = W4_CONVROT_NONE;
++        w4_convrot_group_size         = 0;
++        auto weight_storage           = tensor_storage_map.find(prefix + "weight");
++        const bool is_int8_tensorwise = weight_storage != tensor_storage_map.end() && weight_storage->second.is_int8_tensorwise;
++        const bool is_w4_convrot      = weight_storage != tensor_storage_map.end() && weight_storage->second.w4_convrot_kind != W4_CONVROT_NONE;
+         enum ggml_type wtype    = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
+         if (in_features % ggml_blck_size(wtype) != 0 || force_f32) {
+             wtype = GGML_TYPE_F32;
+         }
+-        params["weight"] = ggml_new_tensor_2d(ctx, wtype, in_features, out_features);
++        if (is_w4_convrot) {
++            // packed nibbles: file tensor is [N, K/2] I8; the graph consumes the
++            // same bytes as [K/2, N] (ggml dims are reversed vs file layout)
++            GGML_ASSERT(in_features % 2 == 0);
++            params["weight"] = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, in_features / 2, out_features);
++        } else {
++            params["weight"] = ggml_new_tensor_2d(ctx, wtype, in_features, out_features);
++        }
+         if (bias) {
+-            enum ggml_type wtype = GGML_TYPE_F32;
+-            params["bias"]       = ggml_new_tensor_1d(ctx, wtype, out_features);
++            params["bias"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_features);
+         }
+-        auto weight_storage           = tensor_storage_map.find(prefix + "weight");
+-        const bool is_int8_tensorwise = weight_storage != tensor_storage_map.end() && weight_storage->second.is_int8_tensorwise;
+         auto weight_scale_storage     = tensor_storage_map.find(prefix + "weight_scale");
+-        if (weight_scale_storage != tensor_storage_map.end()) {
++        if (weight_scale_storage != tensor_storage_map.end() && !is_w4_convrot) {
+             const int64_t scale_nelements = weight_scale_storage->second.nelements();
+             GGML_ASSERT(scale_nelements == 1 || scale_nelements == out_features);
+             params["weight_scale"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scale_nelements);
+@@ -181,6 +227,31 @@
+             int8_convrot            = weight_storage->second.int8_convrot;
+             int8_convrot_group_size = weight_storage->second.int8_convrot_group_size;
+         }
++        if (is_w4_convrot) {
++            w4_convrot_kind       = weight_storage->second.w4_convrot_kind;
++            w4_convrot_group_size = weight_storage->second.w4_convrot_group_size;
++            if (w4_convrot_kind == W4_CONVROT_W4A4) {
++                // row scales load straight from the weight_scale companion
++                GGML_ASSERT(weight_scale_storage != tensor_storage_map.end());
++                const int64_t scale_nelements = weight_scale_storage->second.nelements();
++                GGML_ASSERT(scale_nelements == out_features);
++                params["weight_scale"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scale_nelements);
++                has_weight_scale       = true;
++            } else {
++                GGML_ASSERT(w4_convrot_kind == W4_CONVROT_W4A8);
++                GGML_ASSERT(in_features % 16 == 0);
++                auto codebook_storage  = tensor_storage_map.find(prefix + "weight_codebook");
++                auto s_channel_storage = tensor_storage_map.find(prefix + "weight_s_channel");
++                auto s_rel_storage     = tensor_storage_map.find(prefix + "weight_s_rel");
++                GGML_ASSERT(codebook_storage != tensor_storage_map.end() && codebook_storage->second.nelements() == 16);
++                GGML_ASSERT(s_channel_storage != tensor_storage_map.end() && s_channel_storage->second.nelements() == out_features);
++                GGML_ASSERT(s_rel_storage != tensor_storage_map.end() && s_rel_storage->second.is_f8_e4m3 &&
++                            s_rel_storage->second.nelements() == out_features * (in_features / 16));
++                params["weight_codebook"]  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 16);
++                params["weight_s_channel"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_features);
++                params["weight_s_rel"]     = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, in_features / 16, out_features);
++            }
++        }
+     }
+ 
+ public:
+@@ -230,7 +301,7 @@
+         }
+         ggml_tensor* linear_bias = has_weight_scale ? nullptr : b;
+         ggml_tensor* out         = nullptr;
+-        if (w->type == GGML_TYPE_I8) {
++        if (w->type == GGML_TYPE_I8 && w4_convrot_kind == W4_CONVROT_NONE) {
+             if (x->type != GGML_TYPE_F32) {
+                 x = ggml_ext_cast_f32(ctx->ggml_ctx, ctx->backend, x);
+             }
+@@ -275,6 +346,61 @@
+             }
+             return out;
+         }
++        if (w4_convrot_kind != W4_CONVROT_NONE) {
++            // packed-w4 kernel path: fused Hadamard+int8 activation quant, then
++            // the w4 mul_mat chain (mirrors the int8 branch above)
++            ggml_tensor* lora_input = x;
++            if (x->type != GGML_TYPE_F32) {
++                x = ggml_ext_cast_f32(ctx->ggml_ctx, ctx->backend, x);
++            }
++            if (!ggml_is_contiguous(x)) {
++                x = ggml_cont(ctx->ggml_ctx, x);
++            }
++            if (ctx->weight_adapter && b != nullptr) {
++                b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
++            }
++            // quantize only at unit scale: with scale != 1 the wrapper
++            // pre-scales the F32 input and the w4 kernels quantize inline
++            if (scale == 1.f) {
++                const auto cache_key = std::make_pair(x, w4_convrot_group_size);
++                auto cached          = ctx->int8_convrot_cache.find(cache_key);
++                if (cached == ctx->int8_convrot_cache.end()) {
++                    x = ggml_quantize_i8_convrot(ctx->ggml_ctx, x, w4_convrot_group_size);
++                    ctx->int8_convrot_cache.emplace(cache_key, x);
++                } else {
++                    x = cached->second;
++                }
++            }
++            ggml_tensor* weight_scales = nullptr;
++            ggml_tensor* s_channel     = nullptr;
++            ggml_tensor* s_rel         = nullptr;
++            if (w4_convrot_kind == W4_CONVROT_W4A4) {
++                weight_scales = params["weight_scale"];
++            } else {
++                // the kernel folds codebook x s_channel into its per-group LUT
++                weight_scales = params["weight_codebook"];
++                s_channel     = params["weight_s_channel"];
++                s_rel         = params["weight_s_rel"];
++            }
++            out = ggml_ext_linear_w4_convrot(ctx->ggml_ctx, x, w, weight_scales, s_channel, s_rel, b,
++                                             w4_convrot_kind, w4_convrot_group_size, scale);
++            if (ctx->weight_adapter) {
++                // LoRA was trained on unrotated activations; apply it separately
++                WeightAdapter::ForwardParams forward_params;
++                forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
++                forward_params.linear.force_prec_f32 = force_prec_f32;
++                forward_params.linear.scale          = scale;
++                out                                  = ctx->weight_adapter->add_lora_to_output(ctx->ggml_ctx,
++                                                                                               ctx->backend,
++                                                                                               lora_input,
++                                                                                               w,
++                                                                                               out,
++                                                                                               prefix,
++                                                                                               forward_params);
++                return out;
++            }
++            return out;
++        }
+         if (has_weight_scale) {
+             out = ggml_ext_linear(ctx->ggml_ctx, x, w, nullptr, force_prec_f32, scale);
+             out = ggml_mul(ctx->ggml_ctx, out, weight_scale);
+diff --git a/src/model_io/safetensors_io.cpp b/src/model_io/safetensors_io.cpp
+--- a/src/model_io/safetensors_io.cpp
++++ b/src/model_io/safetensors_io.cpp
+@@ -109,8 +109,9 @@
+ 
+ struct ComfyQuantConfig {
+     std::string format;
+-    bool convrot   = false;
+-    int group_size = 0;
++    bool convrot        = false;
++    int group_size      = 0;  // convrot_groupsize: Hadamard rotation block size
++    int w4a8_group_size = 0;  // asym_w4a8_int8 group_size: s_rel group axis (16)
+ };
+ 
+ static bool read_comfy_quant_config(std::ifstream& file,
+@@ -140,6 +141,7 @@
+         config.format             = json.value("format", "");
+         config.convrot            = json.value("convrot", false);
+         config.group_size         = json.value("convrot_groupsize", 0);
++        config.w4a8_group_size    = json.value("group_size", 0);
+     } catch (const std::exception&) {
+         set_error(error, "parsing ComfyUI quantization metadata tensor failed: '" + tensor_name + "'");
+         return false;
+@@ -340,29 +342,64 @@
+         if (ends_with(name, ".weight")) {
+             const std::string module_name = name.substr(0, name.size() - std::string(".weight").size());
+             auto config                   = comfy_quant_configs.find(module_name);
+-            if (config != comfy_quant_configs.end() && config->second.format == "int8_tensorwise") {
+-                if (type != GGML_TYPE_I8) {
+-                    set_error(error, "ComfyUI int8_tensorwise weight is not I8: '" + name + "'");
+-                    return false;
+-                }
+-                if (config->second.convrot) {
+-                    int group_size_remainder = config->second.group_size;
+-                    while (group_size_remainder > 1 && group_size_remainder % 4 == 0) {
+-                        group_size_remainder /= 4;
++            if (config != comfy_quant_configs.end()) {
++                const std::string& format = config->second.format;
++                const bool is_w4          = format == "convrot_w4a4" || format == "asym_w4a8_int8";
++                if (config->second.format == "int8_tensorwise") {
++                    if (type != GGML_TYPE_I8) {
++                        set_error(error, "ComfyUI int8_tensorwise weight is not I8: '" + name + "'");
++                        return false;
++                    }
++                    if (config->second.convrot) {
++                        int group_size_remainder = config->second.group_size;
++                        while (group_size_remainder > 1 && group_size_remainder % 4 == 0) {
++                            group_size_remainder /= 4;
++                        }
++                        if (group_size_remainder != 1 || tensor_storage.ne[0] % config->second.group_size != 0) {
++                            set_error(error, "invalid ComfyUI convrot group size for tensor '" + name + "'");
++                            return false;
++                        }
++                    }
++                    tensor_storage.is_int8_tensorwise      = true;
++                    tensor_storage.int8_convrot            = config->second.convrot;
++                    tensor_storage.int8_convrot_group_size = config->second.group_size;
++                } else if (is_w4) {
++                    // packed I8 [N, K/2]; ne is ggml order here: ne[0] = K/2, ne[1] = N
++                    if (type != GGML_TYPE_I8) {
++                        set_error(error, "ComfyUI " + format + " weight is not I8: '" + name + "'");
++                        return false;
++                    }
++                    if (tensor_storage.n_dims != 2) {
++                        set_error(error, "ComfyUI " + format + " weight is not 2D: '" + name + "'");
++                        return false;
+                     }
+-                    if (group_size_remainder != 1 || tensor_storage.ne[0] % config->second.group_size != 0) {
++                    const int64_t packed_k = tensor_storage.ne[0];
++                    const int convrot_gs   = config->second.group_size > 0 ? config->second.group_size : 256;
++                    int gs_remainder       = convrot_gs;
++                    while (gs_remainder > 1 && gs_remainder % 4 == 0) {
++                        gs_remainder /= 4;
++                    }
++                    // K must fill whole 32-blocks (converter contract), and K % GS == 0
++                    if (gs_remainder != 1 || (2 * packed_k) % 32 != 0 || (2 * packed_k) % convrot_gs != 0) {
+                         set_error(error, "invalid ComfyUI convrot group size for tensor '" + name + "'");
+                         return false;
+                     }
++                    tensor_storage.w4_convrot_kind       = (format == "convrot_w4a4") ? W4_CONVROT_W4A4 : W4_CONVROT_W4A8;
++                    tensor_storage.w4_convrot_group_size = convrot_gs;
++                    if (format == "asym_w4a8_int8") {
++                        if (config->second.w4a8_group_size <= 0 || (2 * packed_k) % config->second.w4a8_group_size != 0) {
++                            set_error(error, "invalid asym_w4a8_int8 group size for tensor '" + name + "'");
++                            return false;
++                        }
++                        tensor_storage.w4a8_group_size = config->second.w4a8_group_size;
++                    }
+                 }
+-                tensor_storage.is_int8_tensorwise      = true;
+-                tensor_storage.int8_convrot            = config->second.convrot;
+-                tensor_storage.int8_convrot_group_size = config->second.group_size;
+             }
+         } else if (ends_with(name, ".weight_scale")) {
+             const std::string module_name = name.substr(0, name.size() - std::string(".weight_scale").size());
+             auto config                   = comfy_quant_configs.find(module_name);
+-            if (config != comfy_quant_configs.end() && config->second.format == "int8_tensorwise" &&
++            if (config != comfy_quant_configs.end() &&
++                (config->second.format == "int8_tensorwise" || config->second.format == "convrot_w4a4") &&
+                 tensor_storage.n_dims == 2 && tensor_storage.ne[0] == 1) {
+                 tensor_storage.ne[0]  = tensor_storage.ne[1];
+                 tensor_storage.ne[1]  = 1;
+@@ -405,6 +442,8 @@
+             return false;
+         }
+ 
++        // Packed w4 convrot weights stay raw: the w4 kernels consume the packed
++        // bytes in place (type I8, ne = [K/2, N] in ggml order). No rewrite.
+         tensor_storages.push_back(tensor_storage);
+ 
+         // LOG_VERBOSE("%s %s", tensor_storage.to_string().c_str(), dtype.c_str());
+diff --git a/src/model_io/tensor_storage.h b/src/model_io/tensor_storage.h
+--- a/src/model_io/tensor_storage.h
++++ b/src/model_io/tensor_storage.h
+@@ -13,6 +13,15 @@
+ 
+ #define SD_MAX_DIMS 5
+ 
++// ComfyUI packed 4-bit convrot weight formats. The storage is rewritten at read
++// time to its converted representation (de-packed ne + target ggml type), the
++// reblocked bytes are produced by ModelLoader before tensor loading.
++enum W4ConvRotKind {
++    W4_CONVROT_NONE = 0,
++    W4_CONVROT_W4A4 = 1,  // convrot_w4a4: signed nibbles + per-row F32 scale -> GGML_TYPE_Q4_0
++    W4_CONVROT_W4A8 = 2,  // asym_w4a8_int8: codebook + s_channel + s_rel (F8) -> GGML_TYPE_IQ4_NL
++};
++
+ struct TensorStorage {
+     std::string name;
+     ggml_type type              = GGML_TYPE_F32;
+@@ -24,6 +33,9 @@
+     bool is_int8_tensorwise     = false;
+     bool int8_convrot           = false;
+     int int8_convrot_group_size = 0;
++    int w4_convrot_kind         = W4_CONVROT_NONE;
++    int w4_convrot_group_size   = 0;
++    int w4a8_group_size         = 0;
+     int64_t ne[SD_MAX_DIMS]     = {1, 1, 1, 1, 1};
+     int n_dims                  = 0;
+ 
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -811,6 +811,10 @@
+     tensor_type_rules_ = tensor_type_rules;
+     auto map_rules     = parse_tensor_type_rules(tensor_type_rules);
+     for (auto& [name, tensor_storage] : tensor_storage_map) {
++        if (tensor_storage.w4_convrot_kind != W4_CONVROT_NONE) {
++            // target type is intrinsic to the packed format, not subject to overrides
++            continue;
++        }
+         tensor_storage.expected_type = GGML_TYPE_COUNT;
+         ggml_type dst_type           = wtype;
+         for (const auto& tensor_type_rule : map_rules) {
+@@ -1587,7 +1591,15 @@
+     if (tensor_storage.is_int8_tensorwise) {
+         return false;
+     }
+-    if (type != GGML_TYPE_COUNT) {
++    // Packed ComfyUI w4 convrot weights are consumed raw by the w4 kernels;
++    // never route them through the generic conversion machinery.
++    if (tensor_storage.w4_convrot_kind != W4_CONVROT_NONE) {
++        return false;
++    }
++    if (ends_with(name, ".weight_codebook") || ends_with(name, ".weight_s_rel") ||
++        ends_with(name, ".weight_s_channel")) {
++        // Pass, do not convert (w4 convrot companions)
++    } else if (type != GGML_TYPE_COUNT) {
+         if (ggml_is_quantized(type) && tensor_storage.ne[0] % ggml_blck_size(type) != 0) {
+             // Pass, do not convert
+         } else if (ends_with(name, ".bias")) {
+diff --git a/src/model_manager_files.cpp b/src/model_manager_files.cpp
+--- a/src/model_manager_files.cpp
++++ b/src/model_manager_files.cpp
+@@ -12,7 +12,9 @@
+            a.is_f8_e4m3 == b.is_f8_e4m3 && a.is_f8_e5m2 == b.is_f8_e5m2 &&
+            a.is_f64 == b.is_f64 && a.is_i64 == b.is_i64 &&
+            a.is_int8_tensorwise == b.is_int8_tensorwise && a.int8_convrot == b.int8_convrot &&
+-           a.int8_convrot_group_size == b.int8_convrot_group_size;
++           a.int8_convrot_group_size == b.int8_convrot_group_size &&
++           a.w4_convrot_kind == b.w4_convrot_kind && a.w4_convrot_group_size == b.w4_convrot_group_size &&
++           a.w4a8_group_size == b.w4a8_group_size;
+ }
+ 
+ std::vector<TensorStorage> ModelManager::find_tensor_sources(const TensorState& state, const String2TensorStorage& sources) {
+diff --git a/src/pipeline/diffusion_engine.cpp b/src/pipeline/diffusion_engine.cpp
+--- a/src/pipeline/diffusion_engine.cpp
++++ b/src/pipeline/diffusion_engine.cpp
+@@ -1038,7 +1038,7 @@
+     const auto wtype_stat     = model_loader.get_wtype_stat();
+     bool have_int8_tensorwise = false;
+     for (const auto& [_, tensor_storage] : model_loader.get_tensor_storage_map()) {
+-        if (tensor_storage.is_int8_tensorwise) {
++        if (tensor_storage.is_int8_tensorwise || tensor_storage.w4_convrot_kind != W4_CONVROT_NONE) {
+             have_int8_tensorwise = true;
+             break;
+         }

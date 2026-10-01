@@ -1,0 +1,6 @@
+[submodule "stable-diffusion.cpp"]
+	path = deps/stable-diffusion.cpp
+	url = https://github.com/leejet/stable-diffusion.cpp.git
+[submodule "cutlass"]
+	path = deps/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

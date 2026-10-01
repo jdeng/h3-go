@@ -1,0 +1,293 @@
+--- a/src/core/ggml_runner.cpp
++++ b/src/core/ggml_runner.cpp
+@@ -881,7 +881,8 @@
+     SegmentGraphBindings bindings(cut_cache_, plan, graph);
+     SegmentWeightPipeline weights(manager, runtime_backend, reinterpret_cast<uintptr_t>(this),
+                                   graph, plan, params_tensor_set_,
+-                                  segmented && manager != nullptr && manager->prefetch_enabled());
++                                  segmented && manager != nullptr && manager->prefetch_enabled(),
++                                  cyclic_weight_reuse);
+ 
+     std::map<ggml_backend_t, size_t> peak_compute_bytes;
+     auto track_compute_buffer = [&](ggml_backend_t backend) {
+--- a/src/core/ggml_runner.h
++++ b/src/core/ggml_runner.h
+@@ -167,6 +167,7 @@
+ 
+     size_t max_graph_vram_bytes        = 0;
+     bool graph_cut_layer_split_enabled = false;
++    bool cyclic_weight_reuse = false;
+     std::vector<size_t> graph_cut_layer_split_backend_vram_limits_;
+ 
+     std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
+--- a/src/core/segment_weight_pipeline.cpp
++++ b/src/core/segment_weight_pipeline.cpp
+@@ -24,11 +24,13 @@
+         ggml_cgraph* graph,
+         const ggml_graph_cut::Plan& plan,
+         const std::unordered_set<const ggml_tensor*>& params,
+-        bool enabled)
++        bool enabled,
++        bool cyclic_reuse)
+         : residency_manager_(residency_manager),
+           compute_backend_(compute_backend),
+           owner_id_(owner_id),
+-          enabled_(enabled && residency_manager != nullptr) {
++          enabled_(enabled && residency_manager != nullptr),
++          cyclic_reuse_(cyclic_reuse) {
+         segment_params_.resize(plan.segments.size());
+         for (size_t segment_index = 0; segment_index < plan.segments.size(); ++segment_index) {
+             std::unordered_set<ggml_tensor*> seen;
+@@ -56,8 +58,22 @@
+         return SIZE_MAX;
+     }
+ 
+-    std::vector<std::vector<ggml_tensor*>> SegmentWeightPipeline::preferred_eviction_order() const {
+-        return {segment_params_.rbegin(), segment_params_.rend()};
++    std::vector<std::vector<ggml_tensor*>> SegmentWeightPipeline::preferred_eviction_order(size_t segment_index) const {
++        if (!cyclic_reuse_ || segment_params_.empty()) {
++            return {segment_params_.rbegin(), segment_params_.rend()};
++        }
++        std::vector<std::vector<ggml_tensor*>> order(segment_params_.size());
++        std::unordered_set<ggml_tensor*> seen;
++        for (size_t distance = 1; distance <= segment_params_.size(); ++distance) {
++            const size_t next = (segment_index + distance) % segment_params_.size();
++            auto& candidates = order[segment_params_.size() - distance];
++            for (auto* param : segment_params_[next]) {
++                if (seen.insert(param).second) {
++                    candidates.push_back(param);
++                }
++            }
++        }
++        return order;
+     }
+ 
+     void SegmentWeightPipeline::disable() {
+@@ -94,7 +110,7 @@
+         protected_params.insert(protected_params.end(), queued_params_.begin(), queued_params_.end());
+         for (const auto& request : requests) {
+             if (!manager->ensure_compute_backend_capacity(request, segment_params_[segment_index],
+-                                                          preferred_eviction_order(), protected_params)) {
++                                                          preferred_eviction_order(segment_index), protected_params)) {
+                 return false;
+             }
+         }
+@@ -173,7 +189,7 @@
+         protected_params.insert(protected_params.end(), params.begin(), params.end());
+         if (!manager->ensure_compute_backend_capacity(backend_request,
+                                                       params,
+-                                                      preferred_eviction_order(),
++                                                      preferred_eviction_order(segment_index),
+                                                       protected_params)) {
+             disable();
+             return;
+--- a/src/core/segment_weight_pipeline.h
++++ b/src/core/segment_weight_pipeline.h
+@@ -30,9 +30,10 @@
+         std::vector<ggml_tensor*> pinned_params_;
+         size_t queued_segment_ = SIZE_MAX;
+         bool enabled_          = true;
++        bool cyclic_reuse_     = false;
+ 
+         size_t next_parameter_segment(size_t segment_index) const;
+-        std::vector<std::vector<ggml_tensor*>> preferred_eviction_order() const;
++        std::vector<std::vector<ggml_tensor*>> preferred_eviction_order(size_t segment_index) const;
+         void disable();
+         void activate(size_t segment_index);
+         void clear();
+@@ -45,7 +46,8 @@
+             ggml_cgraph* graph,
+             const ggml_graph_cut::Plan& plan,
+             const std::unordered_set<const ggml_tensor*>& params,
+-            bool enabled = true);
++            bool enabled = true,
++            bool cyclic_reuse = false);
+         ~SegmentWeightPipeline();
+ 
+         const std::vector<ggml_tensor*>& params(size_t index) const { return segment_params_[index]; }
+--- a/src/model/diffusion/minimax_h3.hpp
++++ b/src/model/diffusion/minimax_h3.hpp
+@@ -151,6 +151,28 @@
+             auto fc2 = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
+             auto gate_up = fc1->forward(ctx, x);
+ #ifndef SD_USE_UPSTREAM_GGML
++            if (gate_up->op == GGML_OP_ADD && gate_up->type == GGML_TYPE_F32) {
++                ggml_tensor* sources[2] = {gate_up->src[0], gate_up->src[1]};
++                float scales[2] = {1.f, 1.f};
++                for (int index = 0; index < 2; ++index) {
++                    if (sources[index]->op == GGML_OP_SCALE) {
++                        float params[2];
++                        std::memcpy(params, sources[index]->op_params, sizeof(params));
++                        if (params[1] == 0.f) {
++                            scales[index] = params[0];
++                            sources[index] = sources[index]->src[0];
++                        }
++                    }
++                }
++                if (sources[0]->type == GGML_TYPE_F32 && sources[1]->type == GGML_TYPE_F32 &&
++                    ggml_is_contiguous(sources[0]) && ggml_is_contiguous(sources[1]) &&
++                    ggml_are_same_shape(sources[0], sources[1]) && sources[0]->ne[0] % 2 == 0) {
++                    auto fused = ggml_h3_swiglu(ctx->ggml_ctx, sources[0], sources[1], scales[0], scales[1]);
++                    if (ggml_backend_supports_op(ctx->backend, fused)) {
++                        return fc2->forward(ctx, fused);
++                    }
++                }
++            }
+             if (gate_up->type == GGML_TYPE_F32 && ggml_is_contiguous(gate_up)) {
+                 return fc2->forward(ctx, ggml_swiglu(ctx->ggml_ctx, gate_up));
+             }
+@@ -237,6 +259,30 @@
+                                   head_stride, projection->nb[1], projection->nb[2], part_bytes * 2);
+             q                = q_norm->forward(ctx, q);
+             k                = k_norm->forward(ctx, k);
++#ifndef SD_USE_UPSTREAM_GGML
++            if (pe != nullptr && ctx->flash_attn_enabled && head_dim == 128 &&
++                k->op == GGML_OP_MUL && k->src[0]->op == GGML_OP_RMS_NORM &&
++                k->src[0]->src[0]->type == GGML_TYPE_F32 && k->src[0]->src[0]->nb[0] == sizeof(float) &&
++                k->src[1]->type == GGML_TYPE_F32 && ggml_nelements(k->src[1]) == 128 && ggml_is_contiguous(k->src[1]) &&
++                pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe)) {
++                float epsilon;
++                std::memcpy(&epsilon, k->src[0]->op_params, sizeof(epsilon));
++                auto keys = ggml_h3_rms_rope_ext(ctx->ggml_ctx, k->src[0]->src[0], k->src[1], pe,
++                                                epsilon, GGML_TYPE_F16, 1.f / 128.f);
++                auto values = ggml_h3_value_layout(ctx->ggml_ctx, v, 1.f / 128.f);
++                if (ggml_backend_supports_op(ctx->backend, keys) && ggml_backend_supports_op(ctx->backend, values)) {
++                    auto query = apply_partial_rope(ctx, q, pe);
++                    auto attention = ggml_flash_attn_ext(ctx->ggml_ctx, query, keys, values, nullptr,
++                                                         128.f / std::sqrt(float(head_dim)), 0.f, 0.f);
++                    if (ggml_backend_supports_op(ctx->backend, attention)) {
++                        ggml_prec_set_acc(attention, GGML_PREC_F32);
++                        attention = ggml_scale(ctx->ggml_ctx, attention, 128.f);
++                        attention = ggml_reshape_3d(ctx->ggml_ctx, attention, heads * head_dim, sequence, batch);
++                        return out_proj->forward(ctx, attention);
++                    }
++                }
++            }
++#endif
+             if (pe != nullptr) {
+                 q = apply_partial_rope(ctx, q, pe);
+                 k = apply_partial_rope(ctx, k, pe);
+@@ -367,7 +413,31 @@
+         return ggml_ext_chunk(ctx, selected, expand, 0, false);
+     }
+ 
+-    static ggml_tensor* modulate_segments(ggml_context* ctx,
++    static bool fused_modulation_spans(const std::vector<TokenModulationSpan>& segments,
++                                       ggml_tensor* input, ggml_tensor* projection, int expand,
++                                       int32_t* ends, int32_t* rows) {
++        if (segments.empty() || segments.size() > 6 || input->ne[1] > INT32_MAX ||
++            input->type != GGML_TYPE_F32 || !ggml_is_contiguous(input) ||
++            projection->type != GGML_TYPE_F32 || !ggml_is_contiguous(projection) ||
++            ggml_nelements(projection) % (input->ne[0] * expand) != 0) {
++            return false;
++        }
++        int64_t previous_end = 0;
++        const int64_t projection_rows = ggml_nelements(projection) / (input->ne[0] * expand);
++        for (size_t index = 0; index < segments.size(); ++index) {
++            const auto& segment = segments[index];
++            if (segment.start != previous_end || segment.end <= segment.start || segment.end > input->ne[1] ||
++                segment.modulation_row < 0 || segment.modulation_row >= projection_rows || segment.modulation_row > INT32_MAX) {
++                return false;
++            }
++            ends[index] = static_cast<int32_t>(segment.end);
++            rows[index] = static_cast<int32_t>(segment.modulation_row);
++            previous_end = segment.end;
++        }
++        return previous_end == input->ne[1];
++    }
++
++    static ggml_tensor* modulate_segments(GGMLRunnerContext* runner_ctx,
+                                           ggml_tensor* x,
+                                           ggml_tensor* projection,
+                                           const std::vector<TokenModulationSpan>& segments,
+@@ -376,6 +446,21 @@
+                                           int modalities,
+                                           int shift_index,
+                                           int scale_index) {
++        auto ctx = runner_ctx->ggml_ctx;
++#ifndef SD_USE_UPSTREAM_GGML
++        int32_t ends[6], rows[6];
++        if (x->op == GGML_OP_MUL && x->src[0]->op == GGML_OP_RMS_NORM && scale_index == shift_index + 1 &&
++            x->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(x->src[1]) && ggml_nelements(x->src[1]) == hidden_size &&
++            fused_modulation_spans(segments, x->src[0]->src[0], projection, expand, ends, rows)) {
++            float epsilon;
++            std::memcpy(&epsilon, x->src[0]->op_params, sizeof(epsilon));
++            auto fused = ggml_h3_rms_modulate(ctx, x->src[0]->src[0], x->src[1], projection,
++                                             ends, rows, segments.size(), expand, shift_index, epsilon);
++            if (ggml_backend_supports_op(runner_ctx->backend, fused)) {
++                return fused;
++            }
++        }
++#endif
+         ggml_tensor* out = nullptr;
+         for (const auto& segment : segments) {
+             auto mods = modulation_row(ctx,
+@@ -393,13 +478,24 @@
+         return out;
+     }
+ 
+-    static ggml_tensor* gated_residual_segments(ggml_context* ctx,
++    static ggml_tensor* gated_residual_segments(GGMLRunnerContext* runner_ctx,
+                                                 ggml_tensor* x,
+                                                 ggml_tensor* update,
+                                                 ggml_tensor* projection,
+                                                 const std::vector<TokenModulationSpan>& segments,
+                                                 int64_t hidden_size,
+                                                 int gate_index) {
++        auto ctx = runner_ctx->ggml_ctx;
++#ifndef SD_USE_UPSTREAM_GGML
++        int32_t ends[6], rows[6];
++        if (update->type == GGML_TYPE_F32 && ggml_is_contiguous(update) && ggml_are_same_shape(x, update) &&
++            fused_modulation_spans(segments, x, projection, 6, ends, rows)) {
++            auto fused = ggml_h3_gated_residual(ctx, x, update, projection, ends, rows, segments.size(), 6, gate_index);
++            if (ggml_backend_supports_op(runner_ctx->backend, fused)) {
++                return fused;
++            }
++        }
++#endif
+         ggml_tensor* out = nullptr;
+         for (const auto& segment : segments) {
+             auto mods = modulation_row(ctx, projection, hidden_size, 6, 3, segment.modulation_row);
+@@ -444,7 +540,7 @@
+             auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
+             auto mods  = adaln->forward(ctx, t_emb);
+ 
+-            auto h = modulate_segments(ctx->ggml_ctx,
++            auto h = modulate_segments(ctx,
+                                        norm1->forward(ctx, x),
+                                        mods,
+                                        segments,
+@@ -453,14 +549,14 @@
+                                        3,
+                                        0,
+                                        1);
+-            x      = gated_residual_segments(ctx->ggml_ctx,
++            x      = gated_residual_segments(ctx,
+                                              x,
+                                              attn->forward(ctx, h, pe),
+                                              mods,
+                                              segments,
+                                              config.hidden_size,
+                                              2);
+-            h      = modulate_segments(ctx->ggml_ctx,
++            h      = modulate_segments(ctx,
+                                        norm2->forward(ctx, x),
+                                        mods,
+                                        segments,
+@@ -469,7 +565,7 @@
+                                        3,
+                                        3,
+                                        4);
+-            return gated_residual_segments(ctx->ggml_ctx,
++            return gated_residual_segments(ctx,
+                                            x,
+                                            mlp->forward(ctx, h),
+                                            mods,
+@@ -1007,6 +1103,7 @@
+             : DiffusionModelRunner(backend, prefix, weight_manager),
+               config(Config::detect_from_weights(tensors, prefix)),
+               model(config) {
++            cyclic_weight_reuse = true;
+             model.init(params_ctx, tensors, prefix);
+         }
+ 

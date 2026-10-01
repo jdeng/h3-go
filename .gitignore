@@ -1,0 +1,8 @@
+/build/
+/dist/
+/outputs/
+/web-outputs/
+/models/
+/.env
+__pycache__/
+*.pyc

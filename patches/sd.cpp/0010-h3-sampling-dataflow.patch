@@ -1,0 +1,126 @@
+diff --git a/src/core/ggml_runner.h b/src/core/ggml_runner.h
+--- a/src/core/ggml_runner.h
++++ b/src/core/ggml_runner.h
+@@ -31,6 +31,7 @@
+         } op_type;
+         struct {
+             bool force_prec_f32 = false;
++            bool prefer_bf16 = false;
+             float scale         = 1.f;
+         } linear;
+         struct conv2d_params_t {
+@@ -72,6 +73,7 @@
+     bool sage_attn_enabled                                           = false;
+     float linear_scale                                               = 0.f;
+     float attn_scale                                                 = 0.f;
++    bool h3_bf16_dataflow                                             = false;
+     bool conv2d_direct_enabled                                       = false;
+     bool conv3d_direct_enabled                                       = false;
+     bool circular_x_enabled                                          = false;
+diff --git a/src/model/diffusion/minimax_h3.hpp b/src/model/diffusion/minimax_h3.hpp
+--- a/src/model/diffusion/minimax_h3.hpp
++++ b/src/model/diffusion/minimax_h3.hpp
+@@ -167,7 +167,8 @@
+                 if (sources[0]->type == GGML_TYPE_F32 && sources[1]->type == GGML_TYPE_F32 &&
+                     ggml_is_contiguous(sources[0]) && ggml_is_contiguous(sources[1]) &&
+                     ggml_are_same_shape(sources[0], sources[1]) && sources[0]->ne[0] % 2 == 0) {
+-                    auto fused = ggml_h3_swiglu(ctx->ggml_ctx, sources[0], sources[1], scales[0], scales[1]);
++                    const auto output_type = ctx->h3_bf16_dataflow ? GGML_TYPE_BF16 : GGML_TYPE_F32;
++                    auto fused = ggml_h3_swiglu_ext(ctx->ggml_ctx, sources[0], sources[1], scales[0], scales[1], output_type);
+                     if (ggml_backend_supports_op(ctx->backend, fused)) {
+                         return fc2->forward(ctx, fused);
+                     }
+@@ -454,8 +455,9 @@
+             fused_modulation_spans(segments, x->src[0]->src[0], projection, expand, ends, rows)) {
+             float epsilon;
+             std::memcpy(&epsilon, x->src[0]->op_params, sizeof(epsilon));
+-            auto fused = ggml_h3_rms_modulate(ctx, x->src[0]->src[0], x->src[1], projection,
+-                                             ends, rows, segments.size(), expand, shift_index, epsilon);
++            const auto output_type = runner_ctx->h3_bf16_dataflow ? GGML_TYPE_BF16 : GGML_TYPE_F32;
++            auto fused = ggml_h3_rms_modulate_ext(ctx, x->src[0]->src[0], x->src[1], projection,
++                                                 ends, rows, segments.size(), expand, shift_index, epsilon, output_type);
+             if (ggml_backend_supports_op(runner_ctx->backend, fused)) {
+                 return fused;
+             }
+@@ -1255,6 +1257,7 @@
+             }
+ 
+             auto runner_ctx = get_context();
++            runner_ctx.h3_bf16_dataflow = starts_with(ggml_backend_name(runner_ctx.backend), "CUDA");
+             auto output     = model.forward(&runner_ctx,
+                                             video,
+                                             audio,
+diff --git a/src/model/common/ggml_block.hpp b/src/model/common/ggml_block.hpp
+--- a/src/model/common/ggml_block.hpp
++++ b/src/model/common/ggml_block.hpp
+@@ -302,7 +302,10 @@
+         ggml_tensor* linear_bias = has_weight_scale ? nullptr : b;
+         ggml_tensor* out         = nullptr;
+         if (w->type == GGML_TYPE_I8 && w4_convrot_kind == W4_CONVROT_NONE) {
+-            if (x->type != GGML_TYPE_F32) {
++            const float int8_scale = ctx->h3_bf16_dataflow && int8_convrot ? 1.f : scale;
++            const bool bf16_input = ctx->h3_bf16_dataflow && int8_convrot &&
++                                     int8_scale == 1.f && x->type == GGML_TYPE_BF16;
++            if (x->type != GGML_TYPE_F32 && !bf16_input) {
+                 x = ggml_ext_cast_f32(ctx->ggml_ctx, ctx->backend, x);
+             }
+             if (!ggml_is_contiguous(x)) {
+@@ -313,7 +316,7 @@
+                 b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
+             }
+ #ifndef SD_USE_UPSTREAM_GGML
+-            if (int8_convrot && scale == 1.f) {
++            if (int8_convrot && int8_scale == 1.f) {
+                 const auto cache_key = std::make_pair(x, int8_convrot_group_size);
+                 auto cached          = ctx->int8_convrot_cache.find(cache_key);
+                 if (cached == ctx->int8_convrot_cache.end()) {
+@@ -330,11 +333,12 @@
+                                                 weight_scale,
+                                                 b,
+                                                 int8_convrot ? int8_convrot_group_size : 0,
+-                                                scale);
++                                                int8_scale);
+             if (ctx->weight_adapter) {
+                 WeightAdapter::ForwardParams forward_params;
+                 forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;
+                 forward_params.linear.force_prec_f32 = force_prec_f32;
++                forward_params.linear.prefer_bf16    = ctx->h3_bf16_dataflow;
+                 forward_params.linear.scale          = scale;
+                 out                                  = ctx->weight_adapter->add_lora_to_output(ctx->ggml_ctx,
+                                                                                                ctx->backend,
+diff --git a/src/model/adapter/lora.hpp b/src/model/adapter/lora.hpp
+--- a/src/model/adapter/lora.hpp
++++ b/src/model/adapter/lora.hpp
+@@ -808,11 +808,16 @@
+ 
+             ggml_tensor* lx;
+             if (!is_conv2d) {
+-                lx = ggml_ext_linear(ctx, x, lora_down, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
++                const bool bf16_operands = forward_params.linear.prefer_bf16 &&
++                                           lora_down->type == GGML_TYPE_BF16 && lora_up->type == GGML_TYPE_BF16 &&
++                                           (lora_mid == nullptr || lora_mid->type == GGML_TYPE_BF16);
++                const bool force_precision = !bf16_operands && forward_params.linear.force_prec_f32;
++                const float input_scale = bf16_operands ? 1.f : forward_params.linear.scale;
++                lx = ggml_ext_linear(ctx, x, lora_down, nullptr, force_precision, input_scale);
+                 if (lora_mid) {
+-                    lx = ggml_ext_linear(ctx, lx, lora_mid, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
++                    lx = ggml_ext_linear(ctx, lx, lora_mid, nullptr, force_precision, input_scale);
+                 }
+-                lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, forward_params.linear.force_prec_f32, forward_params.linear.scale);
++                lx = ggml_ext_linear(ctx, lx, lora_up, nullptr, force_precision, input_scale);
+             } else {  // OP_CONV2D
+                 lx = ggml_ext_conv_2d(ctx,
+                                       x,
+diff --git a/src/core/ggml_extend.cpp b/src/core/ggml_extend.cpp
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -214,6 +214,9 @@
+                              bool force_prec_f32,
+                              float scale) {
+     if (scale != 1.f) {
++        if (x->type != GGML_TYPE_F32) {
++            x = ggml_cast(ctx, x, GGML_TYPE_F32);
++        }
+         x = ggml_ext_scale(ctx, x, scale);
+     }
+     if (x->ne[2] * x->ne[3] > 1024) {

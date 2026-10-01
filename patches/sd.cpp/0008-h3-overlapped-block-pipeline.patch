@@ -1,0 +1,554 @@
+diff --git a/src/core/ggml_runner.cpp b/src/core/ggml_runner.cpp
+--- a/src/core/ggml_runner.cpp
++++ b/src/core/ggml_runner.cpp
+@@ -759,7 +759,7 @@
+     return true;
+ }
+ 
+-bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
++bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads, bool asynchronous) {
+     if (sd_backend_is_cpu(runtime_backend)) {
+         sd_backend_cpu_set_n_threads(runtime_backend, n_threads);
+     }
+@@ -774,12 +774,16 @@
+             multi_device_eval_callback_warned = true;
+         }
+         status = ggml_backend_sched_graph_compute(scheduler, graph);
++    } else if (asynchronous) {
++        status = ggml_backend_graph_compute_async(runtime_backend, graph);
+     } else {
+         status = sd_backend_graph_compute_with_eval_callback(runtime_backend, graph,
+                                                              sd_get_backend_eval_callback(),
+                                                              sd_get_backend_eval_callback_data());
+     }
+-    workspace_.synchronize();
++    if (!asynchronous) {
++        workspace_.synchronize();
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         last_compute_status_ = status;
+         LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+@@ -873,6 +877,10 @@
+         }
+     }
+     const auto& plan            = segmented ? cached_plan : monolithic_plan;
++    const bool pipelined = cyclic_weight_reuse && segmented && !full_measurement.scheduler &&
++                           sd_backend_is(runtime_backend, "CUDA") &&
++                           sd_get_backend_eval_callback() == nullptr && debug_tensors.empty();
++    cut_cache_.set_reuse(pipelined);
+     const bool segments_changed = plan.segments.size() != logged_segment_count_;
+     if (segments_changed && (segmented || logged_segment_count_ > 1)) {
+         LOG_VERBOSE("%s using %zu segment%s", get_desc().c_str(),
+@@ -977,16 +985,26 @@
+         if (!ensure_capacity()) {
+             return fail_segment("allocated capacity check");
+         }
++        if (pipelined) {
++            if (!cut_cache_.prepare(graph, segment)) {
++                return fail_segment("output buffer preparation");
++            }
++            sync_runtime_residency();
++        }
+         copy_data_to_backend_tensor(segment_graph, false);
+-        auto prefetch_requests = memory_requests(measurement.buffers, new_cache_bytes);
++        auto prefetch_requests = memory_requests(measurement.buffers,
++                                                 pipelined ? cache_.pending_bytes(segment_graph) : new_cache_bytes);
+         if (!prefetch_requests.empty()) {
+-            weights.enqueue_next(index, prefetch_requests.front());
++            weights.enqueue_next(index, prefetch_requests.front(), pipelined);
+         }
+         LOG_DEBUG("%s executing segment %zu/%zu: %s", get_desc().c_str(),
+                   index + 1, plan.segments.size(), segment.group_name.c_str());
+-        if (!execute_segment(segment_graph, n_threads)) {
++        if (!execute_segment(segment_graph, n_threads, pipelined)) {
+             return fail_segment("execution");
+         }
++        if (pipelined) {
++            weights.submit_next();
++        }
+         auto cache_status = cache_.capture(segment_graph);
+         if (cache_status == GGML_STATUS_SUCCESS) {
+             cache_status = cut_cache_.capture(graph, segment, get_desc().c_str());
+@@ -996,6 +1014,10 @@
+             return fail_segment("output caching");
+         }
+         sync_runtime_residency();
++        if (!workspace_.segment_end()) {
++            last_compute_status_ = GGML_STATUS_FAILED;
++            return fail_segment("workspace synchronization");
++        }
+         if (last) {
+             if (read_outputs && !read_outputs()) {
+                 return fail_segment("output finalization");
+@@ -1008,10 +1030,6 @@
+                 }
+             }
+         }
+-        if (!workspace_.segment_end()) {
+-            last_compute_status_ = GGML_STATUS_FAILED;
+-            return fail_segment("workspace synchronization");
+-        }
+         // Final outputs and their callbacks may still be views of consumed cuts.
+         cut_cache_.prune(segment.future_cut_names);
+     }
+diff --git a/src/core/ggml_runner.h b/src/core/ggml_runner.h
+--- a/src/core/ggml_runner.h
++++ b/src/core/ggml_runner.h
+@@ -147,7 +147,7 @@
+                                                      size_t pending_cache_bytes) const;
+     bool fits(const std::vector<DeviceMemoryRequest>& requests,
+               const std::vector<ggml_tensor*>& params) const;
+-    bool execute_segment(ggml_cgraph* graph, int n_threads);
++    bool execute_segment(ggml_cgraph* graph, int n_threads, bool asynchronous = false);
+     std::optional<sd::Tensor<float>> execute_graph(ggml_cgraph* graph, int n_threads, bool no_return, const std::function<bool()>& read_outputs);
+ 
+ protected:
+diff --git a/src/core/runner_cache.cpp b/src/core/runner_cache.cpp
+--- a/src/core/runner_cache.cpp
++++ b/src/core/runner_cache.cpp
+@@ -24,15 +24,12 @@
+         ggml_free(context);
+     }
+ 
+-    std::unique_ptr<CachedTensor> CachedTensor::copy(ggml_backend_t backend,
+-                                                     const std::string& name,
+-                                                     ggml_tensor* source,
+-                                                     ggml_status& status) {
+-        status = GGML_STATUS_FAILED;
++    std::unique_ptr<CachedTensor> CachedTensor::allocate(ggml_backend_t backend,
++                                                         const std::string& name,
++                                                         ggml_tensor* source) {
+         if (ggml_graph_cut::tensor_buffer(source) == nullptr) {
+             return nullptr;
+         }
+-        status         = GGML_STATUS_ALLOC_FAILED;
+         auto entry     = std::make_unique<CachedTensor>();
+         entry->context = ggml_init({2 * ggml_tensor_overhead(), nullptr, true});
+         if (entry->context == nullptr) {
+@@ -46,13 +43,32 @@
+         if (entry->buffer == nullptr) {
+             return nullptr;
+         }
++        return entry;
++    }
++
++    void CachedTensor::copy_from(ggml_backend_t backend, ggml_tensor* source, bool asynchronous) {
+         if (source->view_src != nullptr || !ggml_is_contiguous(source) || source->buffer == nullptr) {
++            ggml_backend_synchronize(backend);
+             std::vector<uint8_t> data(ggml_nbytes(source));
+             ggml_backend_tensor_get(source, data.data(), 0, data.size());
+-            ggml_backend_tensor_set(entry->tensor, data.data(), 0, data.size());
++            ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
++        } else if (asynchronous) {
++            ggml_backend_tensor_copy_async(backend, backend, source, tensor);
+         } else {
+-            ggml_backend_tensor_copy(source, entry->tensor);
++            ggml_backend_tensor_copy(source, tensor);
+         }
++    }
++
++    std::unique_ptr<CachedTensor> CachedTensor::copy(ggml_backend_t backend,
++                                                     const std::string& name,
++                                                     ggml_tensor* source,
++                                                     ggml_status& status) {
++        auto entry = allocate(backend, name, source);
++        status = GGML_STATUS_ALLOC_FAILED;
++        if (entry == nullptr) {
++            return nullptr;
++        }
++        entry->copy_from(backend, source, true);
+         status = GGML_STATUS_SUCCESS;
+         return entry;
+     }
+@@ -115,6 +131,7 @@
+             return GGML_STATUS_SUCCESS;
+         }
+         const auto tensors = cache_graph_tensors(graph);
++        bool copied = false;
+         for (const auto& output : outputs_) {
+             if (pending_.count(output.first) || !tensors.count(output.second)) {
+                 continue;
+@@ -126,8 +143,11 @@
+                 return status;
+             }
+             pending_[output.first] = std::move(entry);
++            copied = true;
++        }
++        if (copied) {
++            ggml_backend_synchronize(backend_);
+         }
+-        ggml_backend_synchronize(backend_);
+         return GGML_STATUS_SUCCESS;
+     }
+ 
+@@ -152,7 +172,45 @@
+     }
+ 
+     size_t GraphCutTensorCache::resident_bytes(ggml_backend_dev_t device) const {
+-        return sd::resident_bytes(tensors_, device);
++        size_t total = sd::resident_bytes(tensors_, device);
++        for (const auto& entry : recycled_) {
++            if (ggml_backend_buft_get_device(ggml_backend_buffer_get_type(entry->buffer)) == device) {
++                const size_t size = ggml_backend_buffer_get_size(entry->buffer);
++                total = size > SIZE_MAX - total ? SIZE_MAX : total + size;
++            }
++        }
++        return total;
++    }
++
++    static bool cache_layout_matches(const CachedTensor& cached, const ggml_tensor* source) {
++        return cached.tensor->type == source->type && ggml_are_same_shape(cached.tensor, source) &&
++               std::equal(std::begin(source->nb), std::end(source->nb), std::begin(cached.tensor->nb));
++    }
++
++    bool GraphCutTensorCache::prepare(ggml_cgraph* graph, const ggml_graph_cut::Segment& segment) {
++        for (int index : segment.output_node_indices) {
++            auto output = ggml_graph_node(graph, index);
++            if (!ggml_graph_cut::is_graph_cut_tensor(output) ||
++                !segment.future_cut_names.count(output->name) || tensors_.count(output->name)) {
++                continue;
++            }
++            auto source = ggml_graph_cut::cache_source_tensor(output);
++            auto spare = std::find_if(recycled_.begin(), recycled_.end(),
++                                       [&](const auto& entry) { return cache_layout_matches(*entry, source); });
++            std::unique_ptr<CachedTensor> entry;
++            if (spare != recycled_.end()) {
++                entry = std::move(*spare);
++                recycled_.erase(spare);
++                ggml_set_name(entry->tensor, output->name);
++            } else {
++                entry = CachedTensor::allocate(backend_, output->name, source);
++            }
++            if (entry == nullptr) {
++                return false;
++            }
++            tensors_[output->name] = std::move(entry);
++        }
++        return true;
+     }
+ 
+     size_t GraphCutTensorCache::estimate_output_bytes(
+@@ -165,6 +223,7 @@
+         }
+         const size_t alignment = ggml_backend_buft_get_alignment(buffer_type);
+         size_t total_size      = 0;
++        std::unordered_set<const CachedTensor*> reused;
+         for (size_t output_idx = 0; output_idx < segment.output_node_indices.size(); ++output_idx) {
+             ggml_tensor* output = ggml_graph_cut::output_tensor(graph, segment, output_idx);
+             if (output == nullptr || !ggml_graph_cut::is_graph_cut_tensor(output) ||
+@@ -172,6 +231,18 @@
+                 continue;
+             }
+             ggml_tensor* source      = ggml_graph_cut::cache_source_tensor(output);
++            if (reuse_) {
++                if (tensors_.count(output->name)) {
++                    continue;
++                }
++                auto spare = std::find_if(recycled_.begin(), recycled_.end(), [&](const auto& entry) {
++                    return !reused.count(entry.get()) && cache_layout_matches(*entry, source);
++                });
++                if (spare != recycled_.end()) {
++                    reused.insert(spare->get());
++                    continue;
++                }
++            }
+             const size_t tensor_size = GGML_PAD(
+                 ggml_backend_buft_get_alloc_size(buffer_type, source), alignment);
+             total_size = tensor_size > SIZE_MAX - total_size ? SIZE_MAX : total_size + tensor_size;
+@@ -181,7 +252,17 @@
+ 
+     void GraphCutTensorCache::prune(const std::unordered_set<std::string>& keep_names) {
+         for (auto it = tensors_.begin(); it != tensors_.end();) {
+-            it = keep_names.count(it->first) ? std::next(it) : tensors_.erase(it);
++            if (keep_names.count(it->first)) {
++                ++it;
++            } else {
++                if (reuse_) {
++                    if (recycled_.size() == 2) {
++                        recycled_.erase(recycled_.begin());
++                    }
++                    recycled_.push_back(std::move(it->second));
++                }
++                it = tensors_.erase(it);
++            }
+         }
+     }
+ 
+@@ -196,6 +277,14 @@
+                 !segment.future_cut_names.count(output->name)) {
+                 continue;
+             }
++            if (reuse_) {
++                auto found = tensors_.find(output->name);
++                if (found == tensors_.end()) {
++                    return GGML_STATUS_ALLOC_FAILED;
++                }
++                found->second->copy_from(backend_, ggml_graph_cut::cache_source_tensor(output), true);
++                continue;
++            }
+             ggml_status status;
+             auto entry = CachedTensor::copy(backend_, output->name, ggml_graph_cut::cache_source_tensor(output), status);
+             if (entry == nullptr) {
+@@ -207,7 +296,9 @@
+             ++copied_count;
+             tensors_[output->name] = std::move(entry);
+         }
+-        ggml_backend_synchronize(backend_);
++        if (!reuse_ && copied_count > 0) {
++            ggml_backend_synchronize(backend_);
++        }
+         if (copied_count > 0) {
+             LOG_DEBUG("%s graph cut cache added %6.2f MB (%zu tensors)",
+                       log_desc, copied_bytes / (1024.f * 1024.f), copied_count);
+diff --git a/src/core/runner_cache.h b/src/core/runner_cache.h
+--- a/src/core/runner_cache.h
++++ b/src/core/runner_cache.h
+@@ -5,6 +5,7 @@
+ #include <memory>
+ #include <string>
+ #include <unordered_set>
++#include <vector>
+ 
+ #include "ggml-backend.h"
+ 
+@@ -18,6 +19,10 @@
+         ggml_backend_buffer_t buffer = nullptr;
+         ggml_tensor* tensor          = nullptr;
+         ~CachedTensor();
++        static std::unique_ptr<CachedTensor> allocate(ggml_backend_t backend,
++                                                      const std::string& name,
++                                                      ggml_tensor* source);
++        void copy_from(ggml_backend_t backend, ggml_tensor* source, bool asynchronous);
+         static std::unique_ptr<CachedTensor> copy(ggml_backend_t backend,
+                                                   const std::string& name,
+                                                   ggml_tensor* source,
+@@ -51,17 +56,21 @@
+     class GraphCutTensorCache {
+         ggml_backend_t backend_;
+         CachedTensors tensors_;
++        std::vector<std::unique_ptr<CachedTensor>> recycled_;
++        bool reuse_ = false;
+ 
+     public:
+         explicit GraphCutTensorCache(ggml_backend_t backend)
+             : backend_(backend) {}
+         ggml_tensor* get(const std::string& name) const;
++        void set_reuse(bool enabled) { reuse_ = enabled; }
++        bool prepare(ggml_cgraph* graph, const ggml_graph_cut::Segment& segment);
+         size_t resident_bytes(ggml_backend_dev_t device) const;
+         size_t estimate_output_bytes(ggml_cgraph* graph,
+                                      const ggml_graph_cut::Segment& segment) const;
+         ggml_status capture(ggml_cgraph* graph, const ggml_graph_cut::Segment& segment, const char* log_desc);
+         void prune(const std::unordered_set<std::string>& keep_names);
+-        void clear() { tensors_.clear(); }
++        void clear() { tensors_.clear(); recycled_.clear(); }
+     };
+ }
+ 
+diff --git a/src/core/segment_weight_pipeline.cpp b/src/core/segment_weight_pipeline.cpp
+--- a/src/core/segment_weight_pipeline.cpp
++++ b/src/core/segment_weight_pipeline.cpp
+@@ -143,7 +143,7 @@
+ 
+     void SegmentWeightPipeline::enqueue_next(
+         size_t segment_index,
+-        const DeviceMemoryRequest& request) {
++        const DeviceMemoryRequest& request, bool defer_upload) {
+         if (!enabled_ || queued_segment_ != SIZE_MAX) {
+             return;
+         }
+@@ -194,7 +194,9 @@
+             disable();
+             return;
+         }
+-        switch (manager->prefetch_params(owner_id_, params)) {
++        const auto result = defer_upload ? manager->prepare_prefetch_params(owner_id_, params)
++                                         : manager->prefetch_params(owner_id_, params);
++        switch (result) {
+             case WeightPrefetchResult::Scheduled:
+                 queued_params_  = std::move(params);
+                 queued_segment_ = next_segment;
+@@ -211,6 +213,14 @@
+         disable();
+     }
+ 
++    void SegmentWeightPipeline::submit_next() {
++        auto manager = residency_manager_.lock();
++        if (queued_segment_ != SIZE_MAX &&
++            (manager == nullptr || !manager->submit_prefetched_params(owner_id_))) {
++            disable();
++        }
++    }
++
+     void SegmentWeightPipeline::clear() {
+         if (auto manager = residency_manager_.lock()) {
+             manager->clear_prefetched_params(owner_id_);
+diff --git a/src/core/segment_weight_pipeline.h b/src/core/segment_weight_pipeline.h
+--- a/src/core/segment_weight_pipeline.h
++++ b/src/core/segment_weight_pipeline.h
+@@ -57,7 +57,8 @@
+         void segment_end();
+         // Prefetch is best effort; segment_start falls back to synchronous loading.
+         void enqueue_next(size_t segment_index,
+-                          const DeviceMemoryRequest& request);
++                          const DeviceMemoryRequest& request, bool defer_upload = false);
++        void submit_next();
+     };
+ }
+ 
+diff --git a/src/model_manager.h b/src/model_manager.h
+--- a/src/model_manager.h
++++ b/src/model_manager.h
+@@ -72,12 +72,20 @@
+     };
+ 
+     struct PrefetchBlock {
++        struct Upload {
++            ggml_tensor* source;
++            ggml_tensor* destination;
++            ggml_backend_t source_backend;
++            void* host_staging;
++        };
+         std::vector<TensorState*> states;
+         ggml_backend_t compute_backend  = nullptr;
+         ggml_backend_t transfer_backend = nullptr;
+         ggml_backend_event_t event      = nullptr;
+         std::vector<std::unique_ptr<ComputeStagingBlock>> staging_blocks;
+         std::vector<std::shared_ptr<struct ggml_backend_buffer>> host_buffers;
++        std::vector<Upload> uploads;
++        bool submitted = false;
+     };
+ 
+     struct RuntimeResidency {
+@@ -293,6 +301,9 @@
+     WeightPrefetchResult prefetch_params(
+         uintptr_t owner_id,
+         const std::vector<ggml_tensor*>& tensors) override;
++    WeightPrefetchResult prepare_prefetch_params(
++        uintptr_t owner_id, const std::vector<ggml_tensor*>& tensors) override;
++    bool submit_prefetched_params(uintptr_t owner_id) override;
+     bool activate_prefetched_params(uintptr_t owner_id,
+                                     const std::vector<ggml_tensor*>& tensors) override;
+     void clear_prefetched_params(uintptr_t owner_id) override;
+diff --git a/src/model_manager_prefetch.cpp b/src/model_manager_prefetch.cpp
+--- a/src/model_manager_prefetch.cpp
++++ b/src/model_manager_prefetch.cpp
+@@ -179,25 +179,13 @@
+             TensorState* state          = pair.first;
+             ggml_tensor* staging_tensor = pair.second;
+             const bool host_source      = ggml_backend_buffer_is_host(state->tensor->buffer);
+-            if (host_source) {
+-                const void* source = state->tensor->data;
+-                if (host_buffer != nullptr && ggml_backend_buffer_get_type(state->tensor->buffer) != host_buffer_type) {
+-                    auto destination = static_cast<char*>(ggml_backend_buffer_get_base(host_buffer.get())) + host_offset;
+-                    std::memcpy(destination, source, ggml_nbytes(state->tensor));
+-                    source = destination;
+-                    host_offset += GGML_PAD(ggml_nbytes(state->tensor), size_t(256));
+-                }
+-                ggml_backend_tensor_set_async(block.transfer_backend,
+-                                              staging_tensor,
+-                                              source,
+-                                              0,
+-                                              ggml_nbytes(state->tensor));
+-            } else {
+-                ggml_backend_tensor_copy_async(state->params_backend,
+-                                               block.transfer_backend,
+-                                               state->tensor,
+-                                               staging_tensor);
++            void* host_staging = nullptr;
++            if (host_source && host_buffer != nullptr &&
++                ggml_backend_buffer_get_type(state->tensor->buffer) != host_buffer_type) {
++                host_staging = static_cast<char*>(ggml_backend_buffer_get_base(host_buffer.get())) + host_offset;
++                host_offset += GGML_PAD(ggml_nbytes(state->tensor), size_t(256));
+             }
++            block.uploads.push_back({state->tensor, staging_tensor, state->params_backend, host_staging});
+         }
+         block.staging_blocks.push_back(std::move(staging_block));
+         return true;
+@@ -223,12 +211,6 @@
+         return false;
+     }
+ 
+-    ggml_backend_dev_t device = ggml_backend_get_device(block.transfer_backend);
+-    block.event               = ggml_backend_event_new(device);
+-    if (block.event != nullptr) {
+-        ggml_backend_event_record(block.event, block.transfer_backend);
+-    }
+-
+     size_t total_size = 0;
+     for (const auto& staging_block : block.staging_blocks) {
+         if (staging_block != nullptr && staging_block->buffer != nullptr) {
+@@ -246,6 +228,48 @@
+ WeightPrefetchResult ModelManager::prefetch_params(
+     uintptr_t owner_id,
+     const std::vector<ggml_tensor*>& tensors) {
++    const auto result = prepare_prefetch_params(owner_id, tensors);
++    if (result == WeightPrefetchResult::Scheduled && !submit_prefetched_params(owner_id)) {
++        clear_prefetched_params(owner_id);
++        return WeightPrefetchResult::Failed;
++    }
++    return result;
++}
++
++bool ModelManager::submit_prefetched_params(uintptr_t owner_id) {
++    auto found = prefetch_blocks_.find(owner_id);
++    if (found == prefetch_blocks_.end()) {
++        return true;
++    }
++    auto& block = *found->second;
++    if (block.submitted) {
++        return true;
++    }
++    for (const auto& upload : block.uploads) {
++        if (ggml_backend_buffer_is_host(upload.source->buffer)) {
++            const void* source = upload.source->data;
++            if (upload.host_staging != nullptr) {
++                std::memcpy(upload.host_staging, source, ggml_nbytes(upload.source));
++                source = upload.host_staging;
++            }
++            ggml_backend_tensor_set_async(block.transfer_backend, upload.destination,
++                                          source, 0, ggml_nbytes(upload.source));
++        } else {
++            ggml_backend_tensor_copy_async(upload.source_backend, block.transfer_backend,
++                                           upload.source, upload.destination);
++        }
++    }
++    block.event = ggml_backend_event_new(ggml_backend_get_device(block.transfer_backend));
++    if (block.event != nullptr) {
++        ggml_backend_event_record(block.event, block.transfer_backend);
++    }
++    block.submitted = true;
++    return true;
++}
++
++WeightPrefetchResult ModelManager::prepare_prefetch_params(
++    uintptr_t owner_id,
++    const std::vector<ggml_tensor*>& tensors) {
+     if (tensors.empty()) {
+         return WeightPrefetchResult::AlreadyResident;
+     }
+@@ -342,6 +366,9 @@
+     if (existing == prefetch_blocks_.end()) {
+         return false;
+     }
++    if (!submit_prefetched_params(owner_id)) {
++        return false;
++    }
+     std::unique_ptr<PrefetchBlock> block = std::move(existing->second);
+     prefetch_blocks_.erase(existing);
+     synchronize_prefetch_block(*block);
+diff --git a/src/device_residency_manager.h b/src/device_residency_manager.h
+--- a/src/device_residency_manager.h
++++ b/src/device_residency_manager.h
+@@ -65,6 +65,11 @@
+     virtual WeightPrefetchResult prefetch_params(
+         uintptr_t owner_id,
+         const std::vector<ggml_tensor*>& tensors)                                     = 0;
++    virtual WeightPrefetchResult prepare_prefetch_params(
++        uintptr_t owner_id, const std::vector<ggml_tensor*>& tensors) {
++        return prefetch_params(owner_id, tensors);
++    }
++    virtual bool submit_prefetched_params(uintptr_t owner_id) { return true; }
+     virtual bool activate_prefetched_params(uintptr_t owner_id,
+                                             const std::vector<ggml_tensor*>& tensors) = 0;
+     virtual void clear_prefetched_params(uintptr_t owner_id)                          = 0;

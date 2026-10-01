@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>H3 native optimization review</title>
+<style>
+body{max-width:1100px;margin:32px auto;padding:0 20px;background:#15171b;color:#eceff4;font:16px system-ui}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:24px}
+article{padding:18px;background:#22262d;border-radius:12px}video{width:100%;border-radius:6px}h2{font-size:18px}p{line-height:1.5;color:#bac2d0}
+</style>
+<h1>H3 native optimization review</h1>
+<p>640 × 384 · 24 fps · 8 steps · CFG 1. Latest sampling dataflow round: 55.59 → 52.03 seconds for 243 frames (6.4% less total time); sampling 41.85 → 38.32 seconds. BF16 normalization/FFN activation storage and LoRA operands, direct INT8 quantization input, fewer ConvRot barriers. Still 21.5% slower than the earlier 42.82-second ComfyUI run. BF16 rounding changes the sampling trajectory; not pixel-identical. All clips are synthetic teapot tests.</p>
+<main>
+<article><h2>Latest 10-second result — h3-go</h2><video controls preload="metadata" src="dataflow-final-10s.mp4"></video><p>52.03 seconds including MP4. Sampling 38.32 seconds; video VAE 8.81 seconds. Partial BF16 sampling dataflow; residual stream and projection outputs remain FP32.</p></article>
+<article><h2>Repeated pre-dataflow baseline</h2><video controls preload="metadata" src="dataflow-before-10s.mp4"></video><p>55.59 seconds including MP4. Sampling 41.85 seconds; video VAE 8.78 seconds. Same prompt, seed and generation settings.</p></article>
+<article><h2>Previous VAE optimization</h2><video controls preload="metadata" src="vae-final-10s.mp4"></video><p>55.95 seconds including MP4. Sampling 42.18 seconds; video VAE 8.91 seconds. Q4_K_M text encoder. Decoder speed is 2.19× the pre-VAE baseline.</p></article>
+<article><h2>Pre-VAE baseline — h3-go</h2><video controls preload="metadata" src="current-native-10s.mp4"></video><p>66.53 seconds including MP4. Sampling 42.19 seconds; video VAE 19.48 seconds. Same native prompt, seed, weights and generation settings.</p></article>
+<article><h2>10-second comparison — ComfyUI</h2><video controls preload="metadata" src="current-comfy-10s.mp4"></video><p>Previously measured 42.82 seconds via API, including MP4. Sampling 30.05 seconds; video VAE 4.96 seconds. Same generation settings, NVFP4/AWQ text encoder, no cached nodes. Not an identical numerical pipeline.</p></article>
+<article><h2>Latest public Go image-to-video</h2><video controls preload="metadata" src="dataflow-go-i2v.mp4"></video><p>56-frame smoke test of the rebuilt public binary using a synthetic first-frame reference. No matched timing claim for this test.</p></article>
+<article><h2>10 seconds — previous GGML attention</h2><video controls preload="metadata" src="attention-before-10s.mp4"></video><p>91.29 seconds including MP4. 243 frames / 10.125 seconds. Previous pipeline overlap and fusions already enabled.</p></article>
+<article><h2>10 seconds — standalone FlashAttention</h2><video controls preload="metadata" src="attention-flash-10s.mp4"></video><p>67.88 seconds including MP4, saving 23.41 seconds. Same prompt, seed, weights and settings. Video VAE remains about 21 seconds.</p></article>
+<article><h2>Short clip — previous attention</h2><video controls preload="metadata" src="attention-before.mp4"></video><p>56 frames / 2.333 seconds. Native CLI 17.19 seconds, excluding MP4 encoding.</p></article>
+<article><h2>Short clip — standalone FlashAttention</h2><video controls preload="metadata" src="attention-flash.mp4"></video><p>16.98 seconds, excluding MP4 encoding. Little end-to-end improvement at this length; the larger gain is on long attention sequences.</p></article>
+<article><h2>Rebuilt Go image-to-video</h2><video controls preload="metadata" src="attention-go-i2v.mp4"></video><p>56-frame smoke test using the same synthetic first-frame reference. No old/new timing or pixel-equivalence claim for this clip.</p></article>
+<article><h2>Earlier ComfyUI / NVFP4 comparison</h2><video controls preload="metadata" src="h3-comfy-nvfp4.mp4"></video><p>12.49 seconds via API. Different encoder quantization, process caches, and VRAM policy.</p></article>
+</main>
+</html>

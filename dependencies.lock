@@ -1,0 +1,3 @@
+stable-diffusion.cpp	deps/stable-diffusion.cpp	https://github.com/leejet/stable-diffusion.cpp.git	3f8527a46c54ecf4cb4ed6003da8e8982283c73c
+ggml	deps/stable-diffusion.cpp/ggml	https://github.com/leejet/ggml.git	89c4413f5da6fb20cc796f16033d37f129be81fd
+cutlass	deps/cutlass	https://github.com/NVIDIA/cutlass.git	d4b4b494c3c51bf6507e7ab09fbafd1e9fa94f39

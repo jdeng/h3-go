@@ -1,0 +1,176 @@
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -3402,13 +3402,13 @@
+         struct ggml_tensor * weight,
+         struct ggml_tensor * position,
+         float epsilon, enum ggml_type output_type, float output_scale) {
+-    GGML_ASSERT(input->type == GGML_TYPE_F32 && input->ne[0] == 128 && input->nb[0] == sizeof(float));
+-    GGML_ASSERT(weight->type == GGML_TYPE_F32 && ggml_nelements(weight) == 128 && ggml_is_contiguous(weight));
++    GGML_ASSERT(input->type == GGML_TYPE_F32 && (input->ne[0] == 64 || input->ne[0] == 128) && input->nb[0] == sizeof(float));
++    GGML_ASSERT(weight == NULL || (weight->type == GGML_TYPE_F32 && ggml_nelements(weight) == input->ne[0] && ggml_is_contiguous(weight)));
+     GGML_ASSERT(position->type == GGML_TYPE_F32 && ggml_is_contiguous(position));
+     GGML_ASSERT(position->ne[0] == 2 && position->ne[1] == 2 && position->ne[3] == input->ne[2]);
+-    GGML_ASSERT(position->ne[2] > 0 && position->ne[2] * 2 <= 128 && epsilon >= 0.0f);
++    GGML_ASSERT(position->ne[2] > 0 && position->ne[2] * 2 <= input->ne[0] && epsilon >= 0.0f);
+     GGML_ASSERT(output_type == GGML_TYPE_F32 || output_type == GGML_TYPE_F16);
+-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, output_type, 128, input->ne[2], input->ne[1] * input->ne[3]);
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, output_type, input->ne[0], input->ne[2], input->ne[1] * input->ne[3]);
+     result->op = GGML_OP_H3_RMS_ROPE;
+     result->src[0] = input;
+     result->src[1] = weight;
+--- a/src/ggml-cuda/h3-fusion.cuh
++++ b/src/ggml-cuda/h3-fusion.cuh
+@@ -6,7 +6,7 @@
+ template <typename Output>
+ static __global__ void h3_rms_rope(
+         const char * input, const float * weight, const float * position, Output * output,
+-        int heads, int tokens, int pairs, size_t head_stride, size_t token_stride,
++        int channels, int heads, int tokens, int pairs, size_t head_stride, size_t token_stride,
+         size_t batch_stride, float epsilon, float output_scale) {
+     const int channel = threadIdx.x;
+     const int head = blockIdx.x % heads;
+@@ -14,21 +14,21 @@
+     const int batch = blockIdx.x / (heads * tokens);
+     const float * row = reinterpret_cast<const float *>(input + head * head_stride +
+                                                        token * token_stride + batch * batch_stride);
+-    float sum = channel < 128 ? row[channel] * row[channel] : 0.0f;
++    float sum = channel < channels ? row[channel] * row[channel] : 0.0f;
+     __shared__ float partial[8];
+     sum = block_reduce<block_reduce_method::SUM, 256>(sum, partial);
+-    const float scale = rsqrtf(sum / 128.0f + epsilon);
+-    if (channel < 128) {
+-        float value = __fmul_rn(__fmul_rn(row[channel], scale), weight[channel]);
++    const float scale = rsqrtf(sum / float(channels) + epsilon);
++    if (channel < channels) {
++        float value = __fmul_rn(__fmul_rn(row[channel], scale), weight == nullptr ? 1.f : weight[channel]);
+         if (channel < pairs * 2) {
+             const int pair = channel % pairs;
+-            const float first = __fmul_rn(__fmul_rn(row[pair], scale), weight[pair]);
+-            const float second = __fmul_rn(__fmul_rn(row[pair + pairs], scale), weight[pair + pairs]);
++            const float first = __fmul_rn(__fmul_rn(row[pair], scale), weight == nullptr ? 1.f : weight[pair]);
++            const float second = __fmul_rn(__fmul_rn(row[pair + pairs], scale), weight == nullptr ? 1.f : weight[pair + pairs]);
+             const int64_t position_offset = (int64_t(token) * pairs + pair) * 4 + (channel / pairs) * 2;
+             value = __fadd_rn(__fmul_rn(first, position[position_offset]),
+                              __fmul_rn(second, position[position_offset + 1]));
+         }
+-        output[((int64_t(batch) * heads + head) * tokens + token) * 128 + channel] = Output(__fmul_rn(value, output_scale));
++        output[((int64_t(batch) * heads + head) * tokens + token) * channels + channel] = Output(__fmul_rn(value, output_scale));
+     }
+ }
+ 
+@@ -40,15 +40,15 @@
+     GGML_ASSERT(rows > 0 && rows <= INT32_MAX);
+     if (output->type == GGML_TYPE_F16) {
+         h3_rms_rope<half><<<rows, 256, 0, context.stream()>>>(
+-            static_cast<const char *>(input->data), static_cast<const float *>(weight->data),
++            static_cast<const char *>(input->data), weight == nullptr ? nullptr : static_cast<const float *>(weight->data),
+             static_cast<const float *>(position->data), static_cast<half *>(output->data),
+-            input->ne[1], input->ne[2], position->ne[2], input->nb[1], input->nb[2], input->nb[3],
++            input->ne[0], input->ne[1], input->ne[2], position->ne[2], input->nb[1], input->nb[2], input->nb[3],
+             ggml_get_op_params_f32(output, 0), ggml_get_op_params_f32(output, 1));
+     } else {
+         h3_rms_rope<float><<<rows, 256, 0, context.stream()>>>(
+-            static_cast<const char *>(input->data), static_cast<const float *>(weight->data),
++            static_cast<const char *>(input->data), weight == nullptr ? nullptr : static_cast<const float *>(weight->data),
+             static_cast<const float *>(position->data), static_cast<float *>(output->data),
+-            input->ne[1], input->ne[2], position->ne[2], input->nb[1], input->nb[2], input->nb[3],
++            input->ne[0], input->ne[1], input->ne[2], position->ne[2], input->nb[1], input->nb[2], input->nb[3],
+             ggml_get_op_params_f32(output, 0), ggml_get_op_params_f32(output, 1));
+     }
+     CUDA_CHECK(cudaGetLastError());
+--- a/src/ggml-cuda/h3-flash-attn.cu
++++ b/src/ggml-cuda/h3-flash-attn.cu
+@@ -3,10 +3,20 @@
+ #include "flash.h"
+ #include "flash_fwd_kernel.h"
+ 
+-using h3_attention_traits = Flash_fwd_kernel_traits<128, 128, 64, 4, false, false, cutlass::half_t>;
++template <int HeadDim>
++using h3_attention_traits = Flash_fwd_kernel_traits<HeadDim, 128, 64, 4, false, false, cutlass::half_t>;
+ 
++template <int HeadDim>
+ static __global__ __launch_bounds__(128) void h3_attention_forward(const flash::Flash_fwd_params params) {
+-    flash::compute_attn<h3_attention_traits, false, false, false, false, false, true, false, false>(params);
++    flash::compute_attn<h3_attention_traits<HeadDim>, false, false, false, false, false, true, false, false>(params);
++}
++
++template <int HeadDim>
++static void h3_attention_launch(const flash::Flash_fwd_params & params, cudaStream_t stream) {
++    const dim3 blocks((params.seqlen_q + 127) / 128, params.b, params.h);
++    constexpr int shared_bytes = h3_attention_traits<HeadDim>::kSmemSize;
++    CUDA_CHECK(cudaFuncSetAttribute(h3_attention_forward<HeadDim>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
++    h3_attention_forward<HeadDim><<<blocks, 128, shared_bytes, stream>>>(params);
+ }
+ 
+ size_t ggml_cuda_h3_flash_attn_get_alloc_size(int device, const ggml_tensor * dst) {
+@@ -16,7 +26,8 @@
+     const int capability = ggml_cuda_info().devices[device].cc;
+     if (!GGML_CUDA_CC_IS_NVIDIA(capability) || capability < GGML_CUDA_CC_BLACKWELL || capability >= GGML_CUDA_CC_RUBIN ||
+             query->type != GGML_TYPE_F32 || keys->type != GGML_TYPE_F16 || values->type != GGML_TYPE_F16 ||
+-            dst->type != GGML_TYPE_F32 || query->ne[0] != 128 || keys->ne[0] != 128 || values->ne[0] != 128 ||
++            dst->type != GGML_TYPE_F32 || (query->ne[0] != 64 && query->ne[0] != 128) ||
++            keys->ne[0] != query->ne[0] || values->ne[0] != query->ne[0] ||
+             query->ne[1] < 1024 || query->ne[1] != keys->ne[1] || keys->ne[1] != values->ne[1] ||
+             query->ne[2] != keys->ne[2] || keys->ne[2] != values->ne[2] ||
+             query->ne[3] != keys->ne[3] || keys->ne[3] != values->ne[3] ||
+@@ -32,7 +43,7 @@
+         return 0;
+     }
+     const size_t count = ggml_nelements(query);
+-    return GGML_PAD(ggml_nbytes(dst), 256) + 2 * GGML_PAD(count * sizeof(half), 256) + count / 128 * sizeof(float);
++    return GGML_PAD(ggml_nbytes(dst), 256) + 2 * GGML_PAD(count * sizeof(half), 256) + count / query->ne[0] * sizeof(float);
+ }
+ 
+ bool ggml_cuda_h3_flash_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -66,13 +77,13 @@
+     params.seqlen_k = keys->ne[1];
+     params.seqlen_q_rounded = GGML_PAD(params.seqlen_q, 128);
+     params.seqlen_k_rounded = GGML_PAD(params.seqlen_k, 64);
+-    params.d = params.d_rounded = 128;
++    params.d = params.d_rounded = query->ne[0];
+     params.total_q = params.b * params.seqlen_q;
+-    params.q_row_stride = params.k_row_stride = params.v_row_stride = 128;
+-    params.q_head_stride = params.k_head_stride = params.v_head_stride = int64_t(params.seqlen_q) * 128;
++    params.q_row_stride = params.k_row_stride = params.v_row_stride = params.d;
++    params.q_head_stride = params.k_head_stride = params.v_head_stride = int64_t(params.seqlen_q) * params.d;
+     params.q_batch_stride = params.k_batch_stride = params.v_batch_stride = params.q_head_stride * params.h;
+-    params.o_head_stride = 128;
+-    params.o_row_stride = int64_t(params.h) * 128;
++    params.o_head_stride = params.d;
++    params.o_row_stride = int64_t(params.h) * params.d;
+     params.o_batch_stride = params.o_row_stride * params.seqlen_q;
+     params.scale_softmax = params.scale_softmax_rp_dropout = scale;
+     params.scale_softmax_log2 = scale * 1.4426950408889634f;
+@@ -81,10 +92,11 @@
+     params.window_size_left = params.window_size_right = -1;
+     params.is_seqlens_k_cumulative = true;
+ 
+-    const dim3 blocks((params.seqlen_q + 127) / 128, params.b, params.h);
+-    constexpr int shared_bytes = h3_attention_traits::kSmemSize;
+-    CUDA_CHECK(cudaFuncSetAttribute(h3_attention_forward, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+-    h3_attention_forward<<<blocks, 128, shared_bytes, stream>>>(params);
++    if (params.d == 64) {
++        h3_attention_launch<64>(params, stream);
++    } else {
++        h3_attention_launch<128>(params, stream);
++    }
+     CUDA_CHECK(cudaGetLastError());
+     ggml_get_to_fp32_cuda(GGML_TYPE_F16)(output_half, static_cast<float *>(dst->data), count, stream);
+     return true;
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -6421,10 +6421,11 @@
+         case GGML_OP_SAGE_ATTN:
+             return ggml_cuda_sage_attn_supported(dev_ctx->device, op);
+         case GGML_OP_H3_RMS_ROPE:
+-            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 128 &&
+-                   op->src[0]->nb[0] == sizeof(float) && op->src[1]->type == GGML_TYPE_F32 &&
++            return op->src[0]->type == GGML_TYPE_F32 && (op->src[0]->ne[0] == 64 || op->src[0]->ne[0] == 128) &&
++                   op->src[0]->nb[0] == sizeof(float) &&
++                   (op->src[1] == nullptr || (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]))) &&
+                    op->src[2]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+-                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]);
++                   ggml_is_contiguous(op->src[2]);
+         case GGML_OP_H3_RMS_MODULATE:
+         case GGML_OP_H3_GATED_RESIDUAL:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
